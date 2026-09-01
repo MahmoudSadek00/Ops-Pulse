@@ -19,12 +19,17 @@ accepting an already-authorized client -- everything else takes plain DataFrames
 can be unit-tested with synthetic data (same philosophy as clean.py / engine.py
 elsewhere in this project family).
 """
+import io
 import re
 import datetime as dt
 
 import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.utils import get_column_letter
+from openpyxl.chart import BarChart, Reference
 
 # Read-only tool -- only needs read scopes, unlike sync_orders.py / orders_status_native
 # which also write to these sheets.
@@ -488,3 +493,326 @@ def generate_summary(comparison, thresholds=None):
         'weak_points': weak_points,
         'thresholds_used': th,
     }
+
+
+# ---------------------------------------------------------------------------
+# Excel export (Sep 2026, per Mahmoud: "عاوز اقدر اسحب الكلام ده اكسيل بكل
+# التفاصيل و الشارتس" -- export whatever's currently on screen, full detail
+# tables + charts, as one .xlsx). Charts here are NATIVE Excel chart objects
+# (openpyxl.chart), built off the same tables written into the sheet -- not
+# picture/image exports of the on-screen Plotly charts. That keeps them
+# editable/native once opened in Excel and avoids adding an image-rendering
+# dependency (kaleido) that isn't otherwise needed anywhere in this app or
+# guaranteed to work on Streamlit Cloud.
+# ---------------------------------------------------------------------------
+
+_XLSX_HEADER_FILL = PatternFill(start_color='1F4E3D', end_color='1F4E3D', fill_type='solid')
+_XLSX_HEADER_FONT = Font(name='Arial', bold=True, color='FFFFFF')
+_XLSX_BODY_FONT = Font(name='Arial')
+_XLSX_TITLE_FONT = Font(name='Arial', bold=True, size=13)
+_XLSX_SUBTITLE_FONT = Font(name='Arial', italic=True, color='555555')
+
+# (key, label, kind) -- same set/order as app.py's render_metric_cards(), kind picks
+# the cell's Excel number_format so rates render as %, money as thousands-separated,
+# etc. (matching how the Streamlit metric cards display them).
+_METRIC_ROWS = [
+    ('total_orders', 'Total Orders', 'count'),
+    ('delivered_rate', 'Delivered rate', 'pct'),
+    ('returned_rate', 'Returned rate', 'pct'),
+    ('cancelled_rate', 'Cancelled rate', 'pct'),
+    ('pending_rate', 'Pending rate', 'pct'),
+    ('fulfillment_lead_time_days', 'Avg. fulfillment lead time (days)', 'days'),
+    ('delivery_time_days', 'Avg. delivery time (days)', 'days'),
+    ('on_time_rate', 'On-time delivery rate', 'pct'),
+    ('new_rate', 'New-customer rate', 'pct'),
+    ('returning_rate', 'Returning-customer rate', 'pct'),
+    ('total_order_value', 'Total order value', 'money'),
+    ('avg_order_value', 'Avg. order value', 'money'),
+]
+
+_PER_COUNTRY_METRICS = [
+    ('total_orders', 'Total Orders', 'count'),
+    ('delivered_rate', 'Delivered rate', 'pct'),
+    ('returned_rate', 'Returned rate', 'pct'),
+    ('cancelled_rate', 'Cancelled rate', 'pct'),
+    ('pending_rate', 'Pending rate', 'pct'),
+    ('fulfillment_lead_time_days', 'Fulfillment lead time (d)', 'days'),
+    ('delivery_time_days', 'Delivery time (d)', 'days'),
+    ('on_time_rate', 'On-time rate', 'pct'),
+    ('new_rate', 'New-customer rate', 'pct'),
+    ('returning_rate', 'Returning-customer rate', 'pct'),
+    ('total_order_value', 'Total order value', 'money'),
+]
+
+_COMPARISON_RATE_KEYS = [
+    ('delivered_rate', 'Delivered rate'),
+    ('cancelled_rate', 'Cancelled rate'),
+    ('returned_rate', 'Returned rate'),
+    ('pending_rate', 'Pending rate'),
+]
+
+_NUMBER_FORMATS = {'pct': '0.0%', 'days': '0.0"d"', 'money': '#,##0', 'count': '#,##0'}
+
+
+def _xlsx_bytes(wb):
+    bio = io.BytesIO()
+    wb.save(bio)
+    bio.seek(0)
+    return bio.getvalue()
+
+
+def _write_title_block(ws, lines, start_row=1):
+    r = start_row
+    for i, line in enumerate(lines):
+        cell = ws.cell(row=r, column=1, value=line)
+        cell.font = _XLSX_TITLE_FONT if i == 0 else _XLSX_SUBTITLE_FONT
+        r += 1
+    return r + 1  # first free row, with a blank-row gap
+
+
+def _write_header_row(ws, row, left_col, headers):
+    for c, name in enumerate(headers, start=left_col):
+        cell = ws.cell(row=row, column=c, value=name)
+        cell.font = _XLSX_HEADER_FONT
+        cell.fill = _XLSX_HEADER_FILL
+        cell.alignment = Alignment(horizontal='center')
+        ws.column_dimensions[get_column_letter(c)].width = max(16, len(str(name)) + 2)
+
+
+def _write_metric_value_table(ws, top_row, left_col, metric_defs, metrics):
+    """Metric | Value table -- one row per (key, label, kind) in metric_defs, value
+    pulled from metrics[key]. Returns (first_data_row, last_data_row)."""
+    _write_header_row(ws, top_row, left_col, ['Metric', 'Value'])
+    r = top_row + 1
+    for key, label, kind in metric_defs:
+        ws.cell(row=r, column=left_col, value=label).font = _XLSX_BODY_FONT
+        val_cell = ws.cell(row=r, column=left_col + 1, value=metrics.get(key))
+        val_cell.font = _XLSX_BODY_FONT
+        val_cell.number_format = _NUMBER_FORMATS[kind]
+        r += 1
+    ws.column_dimensions[get_column_letter(left_col)].width = 36
+    return top_row + 1, r - 1
+
+
+def _write_comparison_metric_table(ws, top_row, left_col, metrics_a, metrics_b, deltas):
+    """Metric | Period A | Period B | Delta | Unit -- same rows as app.py's Comparison
+    tab 'Overall deltas' table."""
+    _write_header_row(ws, top_row, left_col, ['Metric', 'Period A', 'Period B', 'Delta', 'Unit'])
+    r = top_row + 1
+    for key, label in METRIC_LABELS.items():
+        d = deltas.get(key)
+        if d is None:
+            continue
+        kind = 'pct' if key.endswith('_rate') else 'days'
+        unit = 'pp' if kind == 'pct' else 'days'
+        ws.cell(row=r, column=left_col, value=label).font = _XLSX_BODY_FONT
+        for offset, val in ((1, metrics_a.get(key)), (2, metrics_b.get(key))):
+            cell = ws.cell(row=r, column=left_col + offset, value=val)
+            cell.font = _XLSX_BODY_FONT
+            cell.number_format = _NUMBER_FORMATS[kind]
+        delta_cell = ws.cell(row=r, column=left_col + 3, value=d / 100 if kind == 'pct' else d)
+        delta_cell.font = _XLSX_BODY_FONT
+        delta_cell.number_format = '+0.0%;-0.0%' if kind == 'pct' else '+0.0"d";-0.0"d"'
+        ws.cell(row=r, column=left_col + 4, value=unit).font = _XLSX_BODY_FONT
+        r += 1
+    ws.column_dimensions[get_column_letter(left_col)].width = 34
+    return top_row + 1, r - 1
+
+
+def _write_status_table_and_chart(ws, top_row, left_col, metrics, title, anchor_col):
+    headers = ['Status', 'Count']
+    _write_header_row(ws, top_row, left_col, headers)
+    r = top_row + 1
+    for s in STATUSES:
+        ws.cell(row=r, column=left_col, value=s).font = _XLSX_BODY_FONT
+        cell = ws.cell(row=r, column=left_col + 1, value=metrics['status_counts'][s])
+        cell.font = _XLSX_BODY_FONT
+        cell.number_format = _NUMBER_FORMATS['count']
+        r += 1
+    last_row = r - 1
+
+    chart = BarChart()
+    chart.type = 'bar'
+    chart.title = title
+    chart.legend = None
+    chart.height, chart.width = 7, 12
+    data = Reference(ws, min_col=left_col + 1, min_row=top_row, max_row=last_row)
+    cats = Reference(ws, min_col=left_col, min_row=top_row + 1, max_row=last_row)
+    chart.add_data(data, titles_from_data=True)
+    chart.set_categories(cats)
+    ws.add_chart(chart, f"{get_column_letter(anchor_col)}{top_row}")
+    return last_row
+
+
+def _write_per_country_sheet(ws, per_country, title):
+    ws.cell(row=1, column=1, value=title).font = _XLSX_TITLE_FONT
+    top_row = 3
+    headers = ['Country'] + [label for _, label, _ in _PER_COUNTRY_METRICS]
+    _write_header_row(ws, top_row, 1, headers)
+    r = top_row + 1
+    for country in sorted(per_country):
+        m = per_country[country]
+        ws.cell(row=r, column=1, value=country).font = _XLSX_BODY_FONT
+        for c, (key, _, kind) in enumerate(_PER_COUNTRY_METRICS, start=2):
+            cell = ws.cell(row=r, column=c, value=m.get(key))
+            cell.font = _XLSX_BODY_FONT
+            cell.number_format = _NUMBER_FORMATS[kind]
+        r += 1
+    last_row = r - 1
+    if last_row < top_row + 1:
+        return  # no countries in this slice -- nothing to chart
+
+    col_of = {key: c for c, (key, _, _) in enumerate(_PER_COUNTRY_METRICS, start=2)}
+    chart_row = last_row + 3
+    anchor_col = 1
+    for key, label in [('delivered_rate', 'Delivered rate'), ('cancelled_rate', 'Cancelled rate'),
+                        ('returned_rate', 'Returned rate')]:
+        chart = BarChart()
+        chart.type = 'col'
+        chart.title = f"{label} by country"
+        chart.legend = None
+        chart.y_axis.numFmt = '0%'
+        chart.height, chart.width = 7, 11
+        data = Reference(ws, min_col=col_of[key], min_row=top_row, max_row=last_row)
+        cats = Reference(ws, min_col=1, min_row=top_row + 1, max_row=last_row)
+        chart.add_data(data, titles_from_data=True)
+        chart.set_categories(cats)
+        ws.add_chart(chart, f"{get_column_letter(anchor_col)}{chart_row}")
+        anchor_col += 6
+
+
+def export_single_period_xlsx(metrics, meta):
+    """metrics: compute_period_metrics()'s return value. meta: dict with 'countries'
+    (list), 'on_time_target_days', 'generated_at' (str). Returns .xlsx bytes with the
+    same numbers/breakdown as the Overview tab in "Single period" mode."""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = 'Overview'
+    r = _write_title_block(ws, [
+        'Ops Pulse -- Single period report',
+        f"Order Date {metrics['start_date']} → {metrics['end_date']}",
+        f"Countries: {', '.join(meta['countries'])}",
+        f"On-time delivery target: {meta['on_time_target_days']} day(s)",
+        f"Generated: {meta['generated_at']}",
+    ])
+    _, last = _write_metric_value_table(ws, r, 1, _METRIC_ROWS, metrics)
+    _write_status_table_and_chart(ws, last + 3, 1, metrics, 'Orders by status', anchor_col=4)
+
+    ws2 = wb.create_sheet('Per Country')
+    _write_per_country_sheet(ws2, metrics['per_country'], f"{metrics['start_date']} → {metrics['end_date']} -- by country")
+
+    return _xlsx_bytes(wb)
+
+
+def export_comparison_xlsx(comparison, summary, meta):
+    """comparison: compare_periods()'s return value. summary: generate_summary()'s
+    return value. meta: dict with 'countries', 'on_time_target_days', 'generated_at'.
+    Returns .xlsx bytes covering the Overview + Comparison + Summary tabs in "Compare
+    two periods" mode."""
+    metrics_a, metrics_b, deltas = comparison['period_a'], comparison['period_b'], comparison['deltas']
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = 'Overview'
+    r = _write_title_block(ws, [
+        'Ops Pulse -- Comparison report',
+        f"Period A (baseline): {metrics_a['start_date']} → {metrics_a['end_date']}",
+        f"Period B: {metrics_b['start_date']} → {metrics_b['end_date']}",
+        f"Countries: {', '.join(meta['countries'])}",
+        f"On-time delivery target: {meta['on_time_target_days']} day(s)",
+        f"Generated: {meta['generated_at']}",
+    ])
+    _, last = _write_comparison_metric_table(ws, r, 1, metrics_a, metrics_b, deltas)
+    chart_row = last + 3
+    last_a = _write_status_table_and_chart(ws, chart_row, 1, metrics_a, 'Period A -- by status', anchor_col=4)
+    _write_status_table_and_chart(ws, chart_row, 8, metrics_b, 'Period B -- by status', anchor_col=11)
+
+    ws_a = wb.create_sheet('Per Country - Period A')
+    _write_per_country_sheet(ws_a, metrics_a['per_country'], f"Period A: {metrics_a['start_date']} → {metrics_a['end_date']}")
+    ws_b = wb.create_sheet('Per Country - Period B')
+    _write_per_country_sheet(ws_b, metrics_b['per_country'], f"Period B: {metrics_b['start_date']} → {metrics_b['end_date']}")
+
+    ws_cmp = wb.create_sheet('Comparison')
+    ws_cmp.cell(row=1, column=1, value='Period A (baseline) vs. Period B, by market').font = _XLSX_TITLE_FONT
+    row_cursor = 3
+    for rate_key, label in _COMPARISON_RATE_KEYS:
+        countries_here = sorted(set(metrics_a['per_country']) | set(metrics_b['per_country']))
+        rows = []
+        for c in countries_here:
+            va = metrics_a['per_country'].get(c, {}).get(rate_key)
+            vb = metrics_b['per_country'].get(c, {}).get(rate_key)
+            if va is None and vb is None:
+                continue
+            rows.append((c, va, vb))
+        if not rows:
+            continue
+        ws_cmp.cell(row=row_cursor, column=1, value=f"{label} by country").font = _XLSX_SUBTITLE_FONT
+        table_row = row_cursor + 1
+        _write_header_row(ws_cmp, table_row, 1, ['Country', 'Period A', 'Period B'])
+        r2 = table_row + 1
+        for c, va, vb in rows:
+            ws_cmp.cell(row=r2, column=1, value=c).font = _XLSX_BODY_FONT
+            for col_offset, val in ((2, va), (3, vb)):
+                cell = ws_cmp.cell(row=r2, column=col_offset, value=val)
+                cell.font = _XLSX_BODY_FONT
+                cell.number_format = _NUMBER_FORMATS['pct']
+            r2 += 1
+        last_row2 = r2 - 1
+
+        chart = BarChart()
+        chart.type = 'col'
+        chart.title = f"{label} by country — A vs B"
+        chart.height, chart.width = 7, 12
+        chart.y_axis.numFmt = '0%'
+        data = Reference(ws_cmp, min_col=2, max_col=3, min_row=table_row, max_row=last_row2)
+        cats = Reference(ws_cmp, min_col=1, min_row=table_row + 1, max_row=last_row2)
+        chart.add_data(data, titles_from_data=True)
+        chart.set_categories(cats)
+        ws_cmp.add_chart(chart, f"F{row_cursor}")
+
+        row_cursor = max(last_row2, row_cursor + 15) + 3
+
+    ws_sum = wb.create_sheet('Summary')
+    ws_sum.cell(row=1, column=1, value='✅ What\'s working').font = _XLSX_TITLE_FONT
+    r = 3
+    _write_header_row(ws_sum, r, 1, ['Scope', 'Metric', 'Message'])
+    r += 1
+    if summary['good']:
+        for item in summary['good']:
+            ws_sum.cell(row=r, column=1, value=item['scope']).font = _XLSX_BODY_FONT
+            ws_sum.cell(row=r, column=2, value=METRIC_LABELS.get(item['metric'], item['metric'])).font = _XLSX_BODY_FONT
+            ws_sum.cell(row=r, column=3, value=item['message']).font = _XLSX_BODY_FONT
+            r += 1
+    else:
+        ws_sum.cell(row=r, column=1, value='Nothing moved enough (given the thresholds used) to call it a clear improvement.').font = _XLSX_BODY_FONT
+        r += 1
+
+    r += 2
+    ws_sum.cell(row=r, column=1, value='⚠️ Weak points').font = _XLSX_TITLE_FONT
+    r += 2
+    _write_header_row(ws_sum, r, 1, ['Scope', 'Metric', 'Message'])
+    r += 1
+    if summary['weak_points']:
+        for item in summary['weak_points']:
+            ws_sum.cell(row=r, column=1, value=item['scope']).font = _XLSX_BODY_FONT
+            ws_sum.cell(row=r, column=2, value=METRIC_LABELS.get(item['metric'], item['metric'])).font = _XLSX_BODY_FONT
+            ws_sum.cell(row=r, column=3, value=item['message']).font = _XLSX_BODY_FONT
+            r += 1
+    else:
+        ws_sum.cell(row=r, column=1, value='No weak points crossed the thresholds in this comparison.').font = _XLSX_BODY_FONT
+        r += 1
+
+    r += 2
+    ws_sum.cell(row=r, column=1, value='Thresholds used').font = _XLSX_TITLE_FONT
+    r += 2
+    _write_header_row(ws_sum, r, 1, ['Threshold', 'Value'])
+    r += 1
+    for key, val in summary['thresholds_used'].items():
+        ws_sum.cell(row=r, column=1, value=key).font = _XLSX_BODY_FONT
+        ws_sum.cell(row=r, column=2, value=val).font = _XLSX_BODY_FONT
+        r += 1
+    ws_sum.column_dimensions['A'].width = 14
+    ws_sum.column_dimensions['B'].width = 30
+    ws_sum.column_dimensions['C'].width = 80
+
+    return _xlsx_bytes(wb)
