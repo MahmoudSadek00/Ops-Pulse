@@ -680,6 +680,23 @@ def _write_comparison_metric_table(ws, top_row, left_col, metrics_a, metrics_b, 
     return top_row + 1, r - 1
 
 
+def _add_value_labels(chart, position='outEnd'):
+    """Puts ONLY the value on each bar/column (Sep 2026, per Mahmoud: showCatName +
+    showVal together made Excel jam the series name + category + value into one
+    cluttered label per bar -- "مش عاوز الكلام يبوظ الشارت". The country/status name
+    already shows as the normal x-axis tick label via chart.set_categories() -- no
+    need to repeat it inside the data label itself. position='outEnd' puts the value
+    just past the end of the bar (above a column, past the tip of a horizontal bar)."""
+    chart.dataLabels = DataLabelList()
+    chart.dataLabels.showVal = True
+    chart.dataLabels.showCatName = False
+    chart.dataLabels.showSerName = False
+    chart.dataLabels.showLegendKey = False
+    chart.dataLabels.showPercent = False
+    chart.dataLabels.showBubbleSize = False
+    chart.dataLabels.dLblPos = position
+
+
 def _write_status_table_and_chart(ws, top_row, left_col, metrics, title):
     """Status | Count | Value table, with its bar chart (count-based) anchored BELOW
     the table (not beside it) -- keeps the chart clear of whatever table sits to its
@@ -711,8 +728,7 @@ def _write_status_table_and_chart(ws, top_row, left_col, metrics, title):
     cats = Reference(ws, min_col=left_col, min_row=top_row + 1, max_row=last_row)
     chart.add_data(data, titles_from_data=True)
     chart.set_categories(cats)
-    chart.dataLabels = DataLabelList()
-    chart.dataLabels.showVal = True
+    _add_value_labels(chart)
     chart_row = last_row + 2
     ws.add_chart(chart, f"{get_column_letter(left_col)}{chart_row}")
     return chart_row + 14  # bottom row of the chart, roughly (14 rows tall @ ~7cm)
@@ -752,12 +768,9 @@ def _write_per_country_sheet(ws, per_country, title):
         cats = Reference(ws, min_col=1, min_row=top_row + 1, max_row=last_row)
         chart.add_data(data, titles_from_data=True)
         chart.set_categories(cats)
-        # Data labels show BOTH the country and its value directly on each bar (Sep
-        # 2026, per Mahmoud: "الشارت محتاجة يبقى مكتوب عليها ... الدول ايه") -- not
-        # relying on the reader to match a bar back to a small axis label.
-        chart.dataLabels = DataLabelList()
-        chart.dataLabels.showCatName = True
-        chart.dataLabels.showVal = True
+        # Country already shows as the x-axis tick label under each bar (set via
+        # set_categories above) -- the data label itself only needs the value on top.
+        _add_value_labels(chart)
         ws.add_chart(chart, f"{get_column_letter(anchor_col)}{chart_row}")
         anchor_col += 8
 
@@ -866,9 +879,11 @@ def export_comparison_xlsx(comparison, summary, meta):
         cats = Reference(ws_cmp, min_col=1, min_row=table_row + 1, max_row=last_row2)
         chart.add_data(data, titles_from_data=True)
         chart.set_categories(cats)
-        chart.dataLabels = DataLabelList()
-        chart.dataLabels.showCatName = True
-        chart.dataLabels.showVal = True
+        # Legend stays on here (unlike the single-series charts above) since there are
+        # 2 series (label_a vs label_b) sharing each country's pair of bars -- the
+        # legend is what tells them apart; the country itself is still just the x-axis
+        # tick label under each pair.
+        _add_value_labels(chart)
         ws_cmp.add_chart(chart, f"J{row_cursor}")
 
         row_cursor = max(last_row2, row_cursor + 15) + 3
