@@ -10,6 +10,7 @@ from logic import (
     STATUSES, METRIC_LABELS, METRIC_DIRECTION, DEFAULT_ON_TIME_TARGET_DAYS,
     DEFAULT_WEAK_POINT_THRESHOLDS, STAGING_SPREADSHEET_ID_DEFAULT,
     get_client, load_orders_data, compute_period_metrics, compare_periods, generate_summary,
+    export_single_period_xlsx, export_comparison_xlsx,
 )
 
 st.set_page_config(page_title="Ops Pulse", layout="wide")
@@ -309,8 +310,21 @@ def comparison_bar_chart(comparison, rate_key, title, as_pct=True):
 # Compute + render
 # ---------------------------------------------------------------------------
 
+export_meta = {
+    'countries': countries,
+    'on_time_target_days': on_time_target,
+    'generated_at': dt.datetime.now().strftime('%Y-%m-%d %H:%M'),
+}
+
 if mode == "Single period":
     metrics = compute_period_metrics(df, start_date, end_date, countries=countries, on_time_target_days=on_time_target)
+
+    st.download_button(
+        "⬇️ Download this report as Excel",
+        data=export_single_period_xlsx(metrics, export_meta),
+        file_name=f"ops_pulse_{start_date}_to_{end_date}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
     tab_overview, = st.tabs(["Overview"])
     with tab_overview:
@@ -338,6 +352,14 @@ else:
         df, (a_start, a_end), (b_start, b_end), countries=countries, on_time_target_days=on_time_target,
     )
     metrics_a, metrics_b, deltas = comparison['period_a'], comparison['period_b'], comparison['deltas']
+    summary = generate_summary(comparison, thresholds=thresholds)
+
+    st.download_button(
+        "⬇️ Download this report as Excel",
+        data=export_comparison_xlsx(comparison, summary, export_meta),
+        file_name=f"ops_pulse_{a_start}_to_{b_end}_comparison.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
     tab_overview, tab_comparison, tab_summary = st.tabs(["Overview", "Comparison", "Summary"])
 
@@ -373,8 +395,6 @@ else:
             st.dataframe(pd.DataFrame(delta_rows), use_container_width=True, hide_index=True)
 
     with tab_summary:
-        summary = generate_summary(comparison, thresholds=thresholds)
-
         st.subheader("✅ What's working")
         if summary['good']:
             for item in summary['good']:
