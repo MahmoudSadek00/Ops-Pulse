@@ -31,6 +31,20 @@ on-time") to mean anything -- there's a placeholder (5 days, applied to every ma
 the same) in the sidebar's Advanced settings until the CEO scorecard's real per-market
 transit windows are typed in there instead.
 
+**Download as Excel (Sep 2026, per Mahmoud).** A "⬇️ Download this report as Excel"
+button sits above the tabs -- it exports exactly what's currently on screen (whichever
+mode/filters/date range are picked in the sidebar) as one `.xlsx` file:
+- **Single period mode:** an "Overview" sheet (every KPI card's number + the by-status
+  breakdown) and a "Per Country" sheet (the same KPIs broken out per market).
+- **Compare two periods mode:** "Overview" (Period A vs. B vs. Delta table), "Per
+  Country - Period A" / "- Period B", a "Comparison" sheet (A-vs-B by market, one table
+  per rate), and a "Summary" sheet (the same What's working / Weak points readout as
+  the Summary tab, plus the thresholds used).
+
+The charts in the workbook are **native Excel chart objects** built from the tables
+right next to them (not picture exports of the on-screen Plotly charts) -- open,
+editable, and re-colorable in Excel like any chart you'd build there yourself.
+
 ## Run it
 
 ```bash
