@@ -30,7 +30,6 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 from openpyxl.chart import BarChart, Reference
-from openpyxl.chart.label import DataLabelList
 
 # Read-only tool -- only needs read scopes, unlike sync_orders.py / orders_status_native
 # which also write to these sheets.
@@ -511,6 +510,16 @@ def generate_summary(comparison, thresholds=None):
 # editable/native once opened in Excel and avoids adding an image-rendering
 # dependency (kaleido) that isn't otherwise needed anywhere in this app or
 # guaranteed to work on Streamlit Cloud.
+#
+# Deliberately NO per-bar data labels on any chart here (tried once, reverted -- Sep
+# 2026, per Mahmoud). openpyxl writes correct, minimal dLbls XML (verified directly:
+# showVal=1 with every other show* flag explicitly 0), but Google Sheets' xlsx-chart
+# importer doesn't honour those individual flags -- it renders every label as
+# "<series>, <category>, <value>" regardless, which is unreadable once several bars
+# share a chart. Real Excel/LibreOffice would have rendered the clean version fine, but
+# Mahmoud opens these in Google Sheets, so the numbers stay in the table right next to
+# each chart instead -- the axis (country/status) and legend (period, on 2-series
+# charts) are the only in-chart labels, and both render identically everywhere.
 # ---------------------------------------------------------------------------
 
 _XLSX_HEADER_FILL = PatternFill(start_color='1F4E3D', end_color='1F4E3D', fill_type='solid')
@@ -680,23 +689,6 @@ def _write_comparison_metric_table(ws, top_row, left_col, metrics_a, metrics_b, 
     return top_row + 1, r - 1
 
 
-def _add_value_labels(chart, position='outEnd'):
-    """Puts ONLY the value on each bar/column (Sep 2026, per Mahmoud: showCatName +
-    showVal together made Excel jam the series name + category + value into one
-    cluttered label per bar -- "مش عاوز الكلام يبوظ الشارت". The country/status name
-    already shows as the normal x-axis tick label via chart.set_categories() -- no
-    need to repeat it inside the data label itself. position='outEnd' puts the value
-    just past the end of the bar (above a column, past the tip of a horizontal bar)."""
-    chart.dataLabels = DataLabelList()
-    chart.dataLabels.showVal = True
-    chart.dataLabels.showCatName = False
-    chart.dataLabels.showSerName = False
-    chart.dataLabels.showLegendKey = False
-    chart.dataLabels.showPercent = False
-    chart.dataLabels.showBubbleSize = False
-    chart.dataLabels.dLblPos = position
-
-
 def _write_status_table_and_chart(ws, top_row, left_col, metrics, title):
     """Status | Count | Value table, with its bar chart (count-based) anchored BELOW
     the table (not beside it) -- keeps the chart clear of whatever table sits to its
@@ -728,7 +720,12 @@ def _write_status_table_and_chart(ws, top_row, left_col, metrics, title):
     cats = Reference(ws, min_col=left_col, min_row=top_row + 1, max_row=last_row)
     chart.add_data(data, titles_from_data=True)
     chart.set_categories(cats)
-    _add_value_labels(chart)
+    # No per-bar data labels here (Sep 2026, per Mahmoud: they rendered as an
+    # unreadable jumble of "<series>, <status>, <value>" text once opened in Google
+    # Sheets, which doesn't honour the individual show-flags that keep them clean in
+    # real Excel/LibreOffice -- see the module-level note by the imports). The status
+    # name is still the x-axis tick label, and the exact count/value is one column over
+    # in the table right next to the chart.
     chart_row = last_row + 2
     ws.add_chart(chart, f"{get_column_letter(left_col)}{chart_row}")
     return chart_row + 14  # bottom row of the chart, roughly (14 rows tall @ ~7cm)
@@ -768,9 +765,8 @@ def _write_per_country_sheet(ws, per_country, title):
         cats = Reference(ws, min_col=1, min_row=top_row + 1, max_row=last_row)
         chart.add_data(data, titles_from_data=True)
         chart.set_categories(cats)
-        # Country already shows as the x-axis tick label under each bar (set via
-        # set_categories above) -- the data label itself only needs the value on top.
-        _add_value_labels(chart)
+        # No per-bar data labels (see the note in _write_status_table_and_chart above)
+        # -- country is the x-axis tick label, exact numbers are in the table above.
         ws.add_chart(chart, f"{get_column_letter(anchor_col)}{chart_row}")
         anchor_col += 8
 
@@ -881,9 +877,9 @@ def export_comparison_xlsx(comparison, summary, meta):
         chart.set_categories(cats)
         # Legend stays on here (unlike the single-series charts above) since there are
         # 2 series (label_a vs label_b) sharing each country's pair of bars -- the
-        # legend is what tells them apart; the country itself is still just the x-axis
-        # tick label under each pair.
-        _add_value_labels(chart)
+        # legend is what tells them apart. No per-bar data labels (see the note in
+        # _write_status_table_and_chart) -- the exact count/value/rate are all right
+        # there in the table above the chart.
         ws_cmp.add_chart(chart, f"J{row_cursor}")
 
         row_cursor = max(last_row2, row_cursor + 15) + 3
