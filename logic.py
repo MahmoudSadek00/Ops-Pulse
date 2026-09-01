@@ -30,6 +30,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 from openpyxl.chart import BarChart, Reference
+from openpyxl.chart.label import DataLabelList
 
 # Read-only tool -- only needs read scopes, unlike sync_orders.py / orders_status_native
 # which also write to these sheets.
@@ -299,6 +300,11 @@ def _metrics_for_slice(sub, on_time_target_days=None):
     total = len(sub)
     status_counts = {s: int((sub['_status'] == s).sum()) for s in STATUSES}
     status_rates = {s: (status_counts[s] / total if total else None) for s in STATUSES}
+    # Sum of Order Value per status (Sep 2026, per Mahmoud: "عاوز احسب فلوس الاوردرات
+    # الوصلت و الرجعت و الاتكنسل والبندج" -- the money behind each status, not just how
+    # many orders). skipna=True so a blank Order Value cell doesn't turn a real sum
+    # into NaN for the whole status.
+    status_value = {s: float(sub.loc[sub['_status'] == s, '_order_value'].sum(skipna=True)) for s in STATUSES}
 
     fulfillment_days, fulfillment_n = _avg_day_gap(sub, '_order_date', '_shipping_date')
 
@@ -328,6 +334,7 @@ def _metrics_for_slice(sub, on_time_target_days=None):
     return {
         'total_orders': total,
         'status_counts': status_counts,
+        'status_value': status_value,
         'status_rates': status_rates,
         'delivered_rate': status_rates['Delivered'],
         'returned_rate': status_rates['Returned'],
@@ -530,11 +537,27 @@ _METRIC_ROWS = [
     ('avg_order_value', 'Avg. order value', 'money'),
 ]
 
+
+# Per-country table columns -- '__count_<Status>__' / '__value_<Status>__' are synthetic
+# keys resolved via _metric_value() below (pulled from metrics['status_counts'] /
+# metrics['status_value'], not a flat metrics.get() lookup like every other row here) so
+# both the raw order COUNT and the money behind it sit right next to each status's rate
+# (Sep 2026, per Mahmoud: first "الوصل بكام و الرجع بكام و الاتكنسل بكام و البيندينج
+# بكام" -- the counts, not just the % -- then "عاوز احسب فلوس الاوردرات الوصلت و الرجعت
+# و الاتكنسل والبندج" -- the money behind each status too, not just how many orders).
 _PER_COUNTRY_METRICS = [
     ('total_orders', 'Total Orders', 'count'),
+    ('__count_Delivered__', 'Delivered (count)', 'count'),
+    ('__value_Delivered__', 'Delivered (value)', 'money'),
     ('delivered_rate', 'Delivered rate', 'pct'),
+    ('__count_Returned__', 'Returned (count)', 'count'),
+    ('__value_Returned__', 'Returned (value)', 'money'),
     ('returned_rate', 'Returned rate', 'pct'),
+    ('__count_Cancelled__', 'Cancelled (count)', 'count'),
+    ('__value_Cancelled__', 'Cancelled (value)', 'money'),
     ('cancelled_rate', 'Cancelled rate', 'pct'),
+    ('__count_Pending__', 'Pending (count)', 'count'),
+    ('__value_Pending__', 'Pending (value)', 'money'),
     ('pending_rate', 'Pending rate', 'pct'),
     ('fulfillment_lead_time_days', 'Fulfillment lead time (d)', 'days'),
     ('delivery_time_days', 'Delivery time (d)', 'days'),
@@ -544,14 +567,44 @@ _PER_COUNTRY_METRICS = [
     ('total_order_value', 'Total order value', 'money'),
 ]
 
-_COMPARISON_RATE_KEYS = [
-    ('delivered_rate', 'Delivered rate'),
-    ('cancelled_rate', 'Cancelled rate'),
-    ('returned_rate', 'Returned rate'),
-    ('pending_rate', 'Pending rate'),
+# (rate_key, label, status_name) -- status_name indexes metrics['status_counts'] /
+# metrics['status_value'] for the raw count/money columns in the Comparison sheet's
+# per-country tables.
+_COMPARISON_METRICS = [
+    ('delivered_rate', 'Delivered', 'Delivered'),
+    ('cancelled_rate', 'Cancelled', 'Cancelled'),
+    ('returned_rate', 'Returned', 'Returned'),
+    ('pending_rate', 'Pending', 'Pending'),
 ]
 
 _NUMBER_FORMATS = {'pct': '0.0%', 'days': '0.0"d"', 'money': '#,##0', 'count': '#,##0'}
+
+
+def _metric_value(m, key):
+    """Resolves a _PER_COUNTRY_METRICS/_METRIC_ROWS key against a metrics dict -- a
+    '__count_<Status>__' key pulls from the nested status_counts dict, a
+    '__value_<Status>__' key from the nested status_value dict, instead of a flat
+    metrics.get(key) lookup like every other row."""
+    if key.startswith('__count_'):
+        return m.get('status_counts', {}).get(key[len('__count_'):-2])
+    if key.startswith('__value_'):
+        return m.get('status_value', {}).get(key[len('__value_'):-2])
+    return m.get(key)
+
+
+def _period_label(start_date, end_date):
+    """Human label for a period -- the month name/year if the range starts on the 1st
+    and doesn't cross into another calendar month (Sep 2026, per Mahmoud: "اسامي
+    الشهور بدل period a و b"), otherwise the plain date range. Deliberately NOT
+    requiring the end date to land on the exact last day of the month -- the sidebar's
+    date picker is bounded by the data actually loaded (see app.py), so "all of August"
+    often comes out as Aug 1-30 rather than Aug 1-31, and that should still read as
+    "Aug 2026", not fall back to a date range."""
+    start = pd.Timestamp(start_date)
+    end = pd.Timestamp(end_date)
+    if start.day == 1 and end.year == start.year and end.month == start.month:
+        return start.strftime('%b %Y')
+    return f"{start.date()} to {end.date()}"
 
 
 def _xlsx_bytes(wb):
@@ -576,7 +629,14 @@ def _write_header_row(ws, row, left_col, headers):
         cell.font = _XLSX_HEADER_FONT
         cell.fill = _XLSX_HEADER_FILL
         cell.alignment = Alignment(horizontal='center')
-        ws.column_dimensions[get_column_letter(c)].width = max(16, len(str(name)) + 2)
+        letter = get_column_letter(c)
+        # max(), never a blind overwrite -- a column two tables share (e.g. Overview's
+        # column A, used by both the metric table and the status-count table below it)
+        # keeps whichever width fits its widest content instead of a later, narrower
+        # table shrinking it back down and truncating long labels above it.
+        wanted = max(16, len(str(name)) + 2)
+        current = ws.column_dimensions[letter].width
+        ws.column_dimensions[letter].width = max(wanted, current) if current else wanted
 
 
 def _write_metric_value_table(ws, top_row, left_col, metric_defs, metrics):
@@ -594,10 +654,11 @@ def _write_metric_value_table(ws, top_row, left_col, metric_defs, metrics):
     return top_row + 1, r - 1
 
 
-def _write_comparison_metric_table(ws, top_row, left_col, metrics_a, metrics_b, deltas):
-    """Metric | Period A | Period B | Delta | Unit -- same rows as app.py's Comparison
-    tab 'Overall deltas' table."""
-    _write_header_row(ws, top_row, left_col, ['Metric', 'Period A', 'Period B', 'Delta', 'Unit'])
+def _write_comparison_metric_table(ws, top_row, left_col, metrics_a, metrics_b, deltas, label_a, label_b):
+    """Metric | <label A> | <label B> | Delta | Unit -- same rows as app.py's Comparison
+    tab 'Overall deltas' table. label_a/label_b: human period labels (see
+    _period_label()) shown instead of the generic 'Period A'/'Period B'."""
+    _write_header_row(ws, top_row, left_col, ['Metric', label_a, label_b, 'Delta', 'Unit'])
     r = top_row + 1
     for key, label in METRIC_LABELS.items():
         d = deltas.get(key)
@@ -619,8 +680,15 @@ def _write_comparison_metric_table(ws, top_row, left_col, metrics_a, metrics_b, 
     return top_row + 1, r - 1
 
 
-def _write_status_table_and_chart(ws, top_row, left_col, metrics, title, anchor_col):
-    headers = ['Status', 'Count']
+def _write_status_table_and_chart(ws, top_row, left_col, metrics, title):
+    """Status | Count | Value table, with its bar chart (count-based) anchored BELOW
+    the table (not beside it) -- keeps the chart clear of whatever table sits to its
+    right (e.g. this function is called twice per row for Period A/B side by side;
+    anchoring below instead of beside removes any risk of the two charts, or a chart
+    and a neighbouring table, overlapping regardless of exact column widths). The Value
+    column is the money behind each status (Sep 2026, per Mahmoud: "عاوز احسب فلوس
+    الاوردرات الوصلت و الرجعت و الاتكنسل والبندج")."""
+    headers = ['Status', 'Count', 'Value']
     _write_header_row(ws, top_row, left_col, headers)
     r = top_row + 1
     for s in STATUSES:
@@ -628,6 +696,9 @@ def _write_status_table_and_chart(ws, top_row, left_col, metrics, title, anchor_
         cell = ws.cell(row=r, column=left_col + 1, value=metrics['status_counts'][s])
         cell.font = _XLSX_BODY_FONT
         cell.number_format = _NUMBER_FORMATS['count']
+        value_cell = ws.cell(row=r, column=left_col + 2, value=metrics['status_value'][s])
+        value_cell.font = _XLSX_BODY_FONT
+        value_cell.number_format = _NUMBER_FORMATS['money']
         r += 1
     last_row = r - 1
 
@@ -640,8 +711,11 @@ def _write_status_table_and_chart(ws, top_row, left_col, metrics, title, anchor_
     cats = Reference(ws, min_col=left_col, min_row=top_row + 1, max_row=last_row)
     chart.add_data(data, titles_from_data=True)
     chart.set_categories(cats)
-    ws.add_chart(chart, f"{get_column_letter(anchor_col)}{top_row}")
-    return last_row
+    chart.dataLabels = DataLabelList()
+    chart.dataLabels.showVal = True
+    chart_row = last_row + 2
+    ws.add_chart(chart, f"{get_column_letter(left_col)}{chart_row}")
+    return chart_row + 14  # bottom row of the chart, roughly (14 rows tall @ ~7cm)
 
 
 def _write_per_country_sheet(ws, per_country, title):
@@ -654,7 +728,7 @@ def _write_per_country_sheet(ws, per_country, title):
         m = per_country[country]
         ws.cell(row=r, column=1, value=country).font = _XLSX_BODY_FONT
         for c, (key, _, kind) in enumerate(_PER_COUNTRY_METRICS, start=2):
-            cell = ws.cell(row=r, column=c, value=m.get(key))
+            cell = ws.cell(row=r, column=c, value=_metric_value(m, key))
             cell.font = _XLSX_BODY_FONT
             cell.number_format = _NUMBER_FORMATS[kind]
         r += 1
@@ -672,13 +746,20 @@ def _write_per_country_sheet(ws, per_country, title):
         chart.title = f"{label} by country"
         chart.legend = None
         chart.y_axis.numFmt = '0%'
+        chart.x_axis.title = 'Country'
         chart.height, chart.width = 7, 11
         data = Reference(ws, min_col=col_of[key], min_row=top_row, max_row=last_row)
         cats = Reference(ws, min_col=1, min_row=top_row + 1, max_row=last_row)
         chart.add_data(data, titles_from_data=True)
         chart.set_categories(cats)
+        # Data labels show BOTH the country and its value directly on each bar (Sep
+        # 2026, per Mahmoud: "الشارت محتاجة يبقى مكتوب عليها ... الدول ايه") -- not
+        # relying on the reader to match a bar back to a small axis label.
+        chart.dataLabels = DataLabelList()
+        chart.dataLabels.showCatName = True
+        chart.dataLabels.showVal = True
         ws.add_chart(chart, f"{get_column_letter(anchor_col)}{chart_row}")
-        anchor_col += 6
+        anchor_col += 8
 
 
 def export_single_period_xlsx(metrics, meta):
@@ -696,7 +777,7 @@ def export_single_period_xlsx(metrics, meta):
         f"Generated: {meta['generated_at']}",
     ])
     _, last = _write_metric_value_table(ws, r, 1, _METRIC_ROWS, metrics)
-    _write_status_table_and_chart(ws, last + 3, 1, metrics, 'Orders by status', anchor_col=4)
+    _write_status_table_and_chart(ws, last + 3, 1, metrics, 'Orders by status')
 
     ws2 = wb.create_sheet('Per Country')
     _write_per_country_sheet(ws2, metrics['per_country'], f"{metrics['start_date']} → {metrics['end_date']} -- by country")
@@ -710,65 +791,85 @@ def export_comparison_xlsx(comparison, summary, meta):
     Returns .xlsx bytes covering the Overview + Comparison + Summary tabs in "Compare
     two periods" mode."""
     metrics_a, metrics_b, deltas = comparison['period_a'], comparison['period_b'], comparison['deltas']
+    label_a = _period_label(metrics_a['start_date'], metrics_a['end_date'])
+    label_b = _period_label(metrics_b['start_date'], metrics_b['end_date'])
 
     wb = Workbook()
     ws = wb.active
     ws.title = 'Overview'
     r = _write_title_block(ws, [
         'Ops Pulse -- Comparison report',
-        f"Period A (baseline): {metrics_a['start_date']} → {metrics_a['end_date']}",
-        f"Period B: {metrics_b['start_date']} → {metrics_b['end_date']}",
+        f"{label_a} (baseline): {metrics_a['start_date']} → {metrics_a['end_date']}",
+        f"{label_b}: {metrics_b['start_date']} → {metrics_b['end_date']}",
         f"Countries: {', '.join(meta['countries'])}",
         f"On-time delivery target: {meta['on_time_target_days']} day(s)",
         f"Generated: {meta['generated_at']}",
     ])
-    _, last = _write_comparison_metric_table(ws, r, 1, metrics_a, metrics_b, deltas)
+    _, last = _write_comparison_metric_table(ws, r, 1, metrics_a, metrics_b, deltas, label_a, label_b)
     chart_row = last + 3
-    last_a = _write_status_table_and_chart(ws, chart_row, 1, metrics_a, 'Period A -- by status', anchor_col=4)
-    _write_status_table_and_chart(ws, chart_row, 8, metrics_b, 'Period B -- by status', anchor_col=11)
+    bottom_a = _write_status_table_and_chart(ws, chart_row, 1, metrics_a, f"{label_a} -- by status")
+    _write_status_table_and_chart(ws, chart_row, 10, metrics_b, f"{label_b} -- by status")
 
     ws_a = wb.create_sheet('Per Country - Period A')
-    _write_per_country_sheet(ws_a, metrics_a['per_country'], f"Period A: {metrics_a['start_date']} → {metrics_a['end_date']}")
+    _write_per_country_sheet(ws_a, metrics_a['per_country'], f"{label_a} ({metrics_a['start_date']} → {metrics_a['end_date']})")
     ws_b = wb.create_sheet('Per Country - Period B')
-    _write_per_country_sheet(ws_b, metrics_b['per_country'], f"Period B: {metrics_b['start_date']} → {metrics_b['end_date']}")
+    _write_per_country_sheet(ws_b, metrics_b['per_country'], f"{label_b} ({metrics_b['start_date']} → {metrics_b['end_date']})")
 
     ws_cmp = wb.create_sheet('Comparison')
-    ws_cmp.cell(row=1, column=1, value='Period A (baseline) vs. Period B, by market').font = _XLSX_TITLE_FONT
+    ws_cmp.cell(row=1, column=1, value=f"{label_a} (baseline) vs. {label_b}, by market").font = _XLSX_TITLE_FONT
     row_cursor = 3
-    for rate_key, label in _COMPARISON_RATE_KEYS:
+    for rate_key, label, status_name in _COMPARISON_METRICS:
         countries_here = sorted(set(metrics_a['per_country']) | set(metrics_b['per_country']))
         rows = []
         for c in countries_here:
-            va = metrics_a['per_country'].get(c, {}).get(rate_key)
-            vb = metrics_b['per_country'].get(c, {}).get(rate_key)
+            ma = metrics_a['per_country'].get(c, {})
+            mb = metrics_b['per_country'].get(c, {})
+            va, vb = ma.get(rate_key), mb.get(rate_key)
             if va is None and vb is None:
                 continue
-            rows.append((c, va, vb))
+            ca = ma.get('status_counts', {}).get(status_name)
+            cb = mb.get('status_counts', {}).get(status_name)
+            # The money behind this status, per country/period (Sep 2026, per Mahmoud:
+            # "عاوز احسب فلوس الاوردرات الوصلت و الرجعت و الاتكنسل والبندج").
+            fa = ma.get('status_value', {}).get(status_name)
+            fb = mb.get('status_value', {}).get(status_name)
+            rows.append((c, ca, cb, fa, fb, va, vb))
         if not rows:
             continue
         ws_cmp.cell(row=row_cursor, column=1, value=f"{label} by country").font = _XLSX_SUBTITLE_FONT
         table_row = row_cursor + 1
-        _write_header_row(ws_cmp, table_row, 1, ['Country', 'Period A', 'Period B'])
+        _write_header_row(ws_cmp, table_row, 1, [
+            'Country', f"{label_a} (count)", f"{label_b} (count)",
+            f"{label_a} (value)", f"{label_b} (value)",
+            f"{label_a} (rate)", f"{label_b} (rate)",
+        ])
         r2 = table_row + 1
-        for c, va, vb in rows:
+        for c, ca, cb, fa, fb, va, vb in rows:
             ws_cmp.cell(row=r2, column=1, value=c).font = _XLSX_BODY_FONT
-            for col_offset, val in ((2, va), (3, vb)):
+            for col_offset, val, kind in (
+                (2, ca, 'count'), (3, cb, 'count'), (4, fa, 'money'), (5, fb, 'money'),
+                (6, va, 'pct'), (7, vb, 'pct'),
+            ):
                 cell = ws_cmp.cell(row=r2, column=col_offset, value=val)
                 cell.font = _XLSX_BODY_FONT
-                cell.number_format = _NUMBER_FORMATS['pct']
+                cell.number_format = _NUMBER_FORMATS[kind]
             r2 += 1
         last_row2 = r2 - 1
 
         chart = BarChart()
         chart.type = 'col'
-        chart.title = f"{label} by country — A vs B"
+        chart.title = f"{label} rate by country — {label_a} vs {label_b}"
         chart.height, chart.width = 7, 12
         chart.y_axis.numFmt = '0%'
-        data = Reference(ws_cmp, min_col=2, max_col=3, min_row=table_row, max_row=last_row2)
+        chart.x_axis.title = 'Country'
+        data = Reference(ws_cmp, min_col=6, max_col=7, min_row=table_row, max_row=last_row2)
         cats = Reference(ws_cmp, min_col=1, min_row=table_row + 1, max_row=last_row2)
         chart.add_data(data, titles_from_data=True)
         chart.set_categories(cats)
-        ws_cmp.add_chart(chart, f"F{row_cursor}")
+        chart.dataLabels = DataLabelList()
+        chart.dataLabels.showCatName = True
+        chart.dataLabels.showVal = True
+        ws_cmp.add_chart(chart, f"J{row_cursor}")
 
         row_cursor = max(last_row2, row_cursor + 15) + 3
 
