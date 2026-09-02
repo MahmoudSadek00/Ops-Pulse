@@ -257,6 +257,16 @@ def render_metric_cards(metrics, delta_metrics=None):
     c12.metric("Avg. order value", _money(metrics['avg_order_value']))
 
 
+def status_value_table(metrics):
+    """Status | Orders | Value -- the money behind each status (Sep 2026, per Mahmoud:
+    "عاوز احسب فلوس الاوردرات الوصلت و الرجعت و الاتكنسل والبندج"), same numbers as the
+    Excel export's status table, shown right under its matching status chart here."""
+    return pd.DataFrame([
+        {'Status': s, 'Orders': f"{metrics['status_counts'][s]:,}", 'Value': _money(metrics['status_value'][s])}
+        for s in STATUSES
+    ])
+
+
 def status_breakdown_chart(metrics, title):
     counts = metrics['status_counts']
     fig = go.Figure(go.Bar(
@@ -333,6 +343,7 @@ if mode == "Single period":
         col1, col2 = st.columns(2)
         with col1:
             st.plotly_chart(status_breakdown_chart(metrics, "Orders by status"), use_container_width=True)
+            st.dataframe(status_value_table(metrics), use_container_width=True, hide_index=True)
         with col2:
             fig = per_country_rate_chart(metrics, 'delivered_rate', "Delivered rate by country")
             if fig:
@@ -369,8 +380,10 @@ else:
         col1, col2 = st.columns(2)
         with col1:
             st.plotly_chart(status_breakdown_chart(metrics_a, f"Period A ({a_start} → {a_end}) -- by status"), use_container_width=True)
+            st.dataframe(status_value_table(metrics_a), use_container_width=True, hide_index=True)
         with col2:
             st.plotly_chart(status_breakdown_chart(metrics_b, f"Period B ({b_start} → {b_end}) -- by status"), use_container_width=True)
+            st.dataframe(status_value_table(metrics_b), use_container_width=True, hide_index=True)
 
     with tab_comparison:
         st.caption("Period A (baseline) vs. Period B, by market. Compare the % charts even when the two periods are different lengths.")
