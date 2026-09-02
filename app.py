@@ -256,15 +256,20 @@ def render_metric_cards(metrics, delta_metrics=None):
                delta_color="off")
     c12.metric("Avg. order value", _money(metrics['avg_order_value']))
 
-
-def status_value_table(metrics):
-    """Status | Orders | Value -- the money behind each status (Sep 2026, per Mahmoud:
-    "عاوز احسب فلوس الاوردرات الوصلت و الرجعت و الاتكنسل والبندج"), same numbers as the
-    Excel export's status table, shown right under its matching status chart here."""
-    return pd.DataFrame([
-        {'Status': s, 'Orders': f"{metrics['status_counts'][s]:,}", 'Value': _money(metrics['status_value'][s])}
-        for s in STATUSES
-    ])
+    # The money behind each status (Sep 2026, per Mahmoud: "عاوز احسب فلوس الاوردرات
+    # الوصلت و الرجعت و الاتكنسل والبندج") -- same card concept as every metric above,
+    # not a separate table. Delivered value is "higher is better" like delivered_rate;
+    # Returned/Cancelled/Pending value are "lower is better" like their rates.
+    c13, c14, c15, c16 = st.columns(4)
+    for col, status, direction in (
+        (c13, 'Delivered', 1), (c14, 'Returned', -1), (c15, 'Cancelled', -1), (c16, 'Pending', -1),
+    ):
+        delta_key = f'status_value_{status}'
+        col.metric(
+            f"{status} value", _money(metrics['status_value'][status]),
+            delta=(f"{delta_metrics[delta_key]:+,.0f}" if delta_metrics and delta_metrics.get(delta_key) is not None else None),
+            delta_color=("normal" if direction == 1 else "inverse"),
+        )
 
 
 def status_breakdown_chart(metrics, title):
@@ -343,7 +348,6 @@ if mode == "Single period":
         col1, col2 = st.columns(2)
         with col1:
             st.plotly_chart(status_breakdown_chart(metrics, "Orders by status"), use_container_width=True)
-            st.dataframe(status_value_table(metrics), use_container_width=True, hide_index=True)
         with col2:
             fig = per_country_rate_chart(metrics, 'delivered_rate', "Delivered rate by country")
             if fig:
@@ -380,10 +384,8 @@ else:
         col1, col2 = st.columns(2)
         with col1:
             st.plotly_chart(status_breakdown_chart(metrics_a, f"Period A ({a_start} → {a_end}) -- by status"), use_container_width=True)
-            st.dataframe(status_value_table(metrics_a), use_container_width=True, hide_index=True)
         with col2:
             st.plotly_chart(status_breakdown_chart(metrics_b, f"Period B ({b_start} → {b_end}) -- by status"), use_container_width=True)
-            st.dataframe(status_value_table(metrics_b), use_container_width=True, hide_index=True)
 
     with tab_comparison:
         st.caption("Period A (baseline) vs. Period B, by market. Compare the % charts even when the two periods are different lengths.")
