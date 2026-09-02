@@ -395,6 +395,14 @@ def compare_periods(df, period_a, period_b, countries=None, on_time_target_days=
         d.update({k: _delta(k, a_dict, b_dict, as_pp=False) for k in day_keys})
         d['total_orders'] = (b_dict['total_orders'] - a_dict['total_orders']) if (a_dict['total_orders'] is not None and b_dict['total_orders'] is not None) else None
         d['total_order_value'] = b_dict['total_order_value'] - a_dict['total_order_value']
+        # Per-status count/value deltas (Sep 2026, per Mahmoud: the money behind
+        # Delivered/Returned/Cancelled/Pending, as its own metric card like the rest --
+        # not just a number in a table) -- keyed 'status_count_<Status>' /
+        # 'status_value_<Status>' so app.py's metric cards can pull a delta the same
+        # way every other card does.
+        for s in STATUSES:
+            d[f'status_count_{s}'] = b_dict['status_counts'][s] - a_dict['status_counts'][s]
+            d[f'status_value_{s}'] = b_dict['status_value'][s] - a_dict['status_value'][s]
         return d
 
     overall_deltas = _deltas_for(metrics_a, metrics_b)
