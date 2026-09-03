@@ -70,10 +70,46 @@ STATUSES = ['Delivered', 'Returned', 'Pending', 'Cancelled']
 GOOGLE_SHEETS_EPOCH = dt.date(1899, 12, 30)
 _ISO_DATE_RE = re.compile(r'^\s*(\d{4})-(\d{2})-(\d{2})\s*$')
 
-# Default "how many days late counts as not-on-time" -- a placeholder until Mahmoud
-# plugs in the CEO scorecard's real per-market transit windows via the UI (see app.py's
-# 'On-time delivery target' inputs). Kept small and clearly a guess, not a real target.
+# Default "how many days late counts as not-on-time" -- fallback only, used if a
+# country shows up with no entry in a per-market target dict at all. The real per-market
+# numbers now live in DEFAULT_DELIVERY_WINDOWS below (Sep 2026, CEO Q3 2026 scorecard --
+# "GC KPIs, Younes" -- Delivery Time KPI row), plugged in via app.py's sidebar.
 DEFAULT_ON_TIME_TARGET_DAYS = 5
+
+# Per-market transit windows in days, Shipping Date -> Delivery Date (Sep 2026, from the
+# CEO Q3 2026 scorecard's "Delivery Time" KPI row: "Within window: UAE 2-3d, KSA 5-7d,
+# QA 5-7d, KW 10-12d, OM (via UAE) 7-10d"). (low, high) per market -- 'high' doubles as
+# the On-Time Delivery Rate's per-market target (an order delivered within the window,
+# i.e. gap <= high, counts as on-time; see _resolve_on_time_target()). 'low' is only
+# used for the Delivery Time KPI's own Below/Target/Exceed band (see
+# classify_delivery_time_band()). Iraq has no window in the scorecard -- Delivery Date
+# isn't captured there yet (see the module docstring) -- so it's left out on purpose
+# rather than guessed; Iraq is excluded from On-Time Delivery Rate and from Delivery
+# Time bands until a real window exists for it, exactly like it already is from the
+# Delivery Time average itself.
+DEFAULT_DELIVERY_WINDOWS = {
+    'UAE': (2, 3),
+    'OM': (7, 10),
+    'SA': (5, 7),
+    'QA': (5, 7),
+    'KW': (10, 12),
+}
+
+# Below/Target/Exceed cutoffs for the 2 rate-based KPIs that the scorecard gives ONE
+# flat number for regardless of market (unlike Delivery Time's per-market windows
+# above). 'below' isn't stored -- classify_band() treats "under target" as Below by
+# definition, so only the 2 real cutoffs need a home.
+DEFAULT_KPI_BANDS = {
+    'on_time_rate': {'target': 0.95, 'exceed': 0.97},        # scorecard: <90% Below
+    'net_delivery_rate': {'target': 0.92, 'exceed': 0.95},   # scorecard: <88% Below
+}
+
+# Net Delivery Rate's "matured cohort" gate (Sep 2026, CEO scorecard: "no rate quoted
+# while >10% in transit"): the share of a period's Shipped orders still Pending
+# (in transit -- shipped but not yet Delivered/Returned) has to be at or under this
+# share before the rate is quoted at all -- see _metrics_for_slice()'s net_delivery_rate
+# / net_delivery_matured / in_transit_share.
+DEFAULT_NET_DELIVERY_MATURED_THRESHOLD = 0.10
 
 # Weak-point thresholds (Sep 2026, per Mahmoud: "sensible defaults I define, but keep
 # them adjustable from the UI too" -- see app.py's threshold sliders). All in
@@ -87,6 +123,7 @@ DEFAULT_WEAK_POINT_THRESHOLDS = {
     'fulfillment_lead_time_days': 1.0,  # got slower by >= 1 day
     'delivery_time_days': 1.0,          # got slower by >= 1 day
     'on_time_rate_pp': 5.0,             # dropped by >= 5pp
+    'net_delivery_rate_pp': 5.0,        # dropped by >= 5pp
 }
 
 METRIC_LABELS = {
@@ -97,6 +134,7 @@ METRIC_LABELS = {
     'fulfillment_lead_time_days': 'Avg. fulfillment lead time (days)',
     'delivery_time_days': 'Avg. delivery time (days)',
     'on_time_rate': 'On-time delivery rate',
+    'net_delivery_rate': 'Net delivery rate',
     'new_rate': 'New-customer rate',
     'returning_rate': 'Returning-customer rate',
 }
@@ -111,9 +149,42 @@ METRIC_DIRECTION = {
     'fulfillment_lead_time_days': -1,
     'delivery_time_days': -1,
     'on_time_rate': 1,
+    'net_delivery_rate': 1,
     'new_rate': 1,
     'returning_rate': 1,
 }
+
+
+def classify_band(value, target, exceed):
+    """value: a 0-1 rate (e.g. on_time_rate, net_delivery_rate). target/exceed: the 2
+    cutoffs from DEFAULT_KPI_BANDS (or the sidebar's adjusted versions) -- 'target'
+    means "at or above the Target line but short of Exceed" (the scorecard's Green
+    band: hitting the number exactly still counts as on target, not short of it).
+    Returns 'exceed' / 'target' / 'below', or None if value or target is missing."""
+    if value is None or target is None:
+        return None
+    if exceed is not None and value >= exceed:
+        return 'exceed'
+    if value >= target:
+        return 'target'
+    return 'below'
+
+
+def classify_delivery_time_band(avg_days, window):
+    """window: (low, high) from DEFAULT_DELIVERY_WINDOWS (or the sidebar's adjusted
+    version) for ONE market -- Delivery Time is the only KPI here where 'Target' is a
+    range, not a single cutoff, so it needs its own classifier. Below (Red) = averaged
+    above the window; Target (Green) = inside the window; Exceed (Stretch) = at or below
+    the window's lower bound -- mirrors the scorecard's 3 bands for this KPI exactly.
+    Returns None (no band) if there's no window for this market (Iraq) or no data."""
+    if avg_days is None or not window:
+        return None
+    lo, hi = window
+    if avg_days <= lo:
+        return 'exceed'
+    if avg_days <= hi:
+        return 'target'
+    return 'below'
 
 
 # ---------------------------------------------------------------------------
@@ -293,7 +364,7 @@ def _resolve_on_time_target(country, on_time_target_days):
     return on_time_target_days  # single number applied to every market
 
 
-def _metrics_for_slice(sub, on_time_target_days=None):
+def _metrics_for_slice(sub, on_time_target_days=None, net_delivery_matured_threshold=DEFAULT_NET_DELIVERY_MATURED_THRESHOLD):
     """sub: an already-filtered (period + country) DataFrame slice. Returns the flat
     metrics dict shared by both the overall and the per-country breakdown."""
     total = len(sub)
@@ -330,6 +401,26 @@ def _metrics_for_slice(sub, on_time_target_days=None):
     total_value = float(sub['_order_value'].sum(skipna=True)) if total else 0.0
     avg_value = (total_value / total) if total else None
 
+    # Net Delivery Rate = (Delivered - Returned) / Shipped, "matured cohorts only" (Sep
+    # 2026, CEO Q3 2026 scorecard). "Shipped" = orders that actually reached the
+    # shipping company -- i.e. have a Shipping Date at all -- which naturally excludes
+    # Cancelled (cancelled before ever shipping, so it never gets one -- see
+    # orders_status_native/logic.py) and any Pending order still sitting in Not Shipped
+    # waiting to go out. A Pending order WITH a Shipping Date is a different thing: it
+    # HAS shipped, just hasn't resolved (delivered or returned) yet -- "still in
+    # transit". "Matured" is a COHORT-level gate, not a per-order age check: if more
+    # than net_delivery_matured_threshold's share of this period's Shipped orders are
+    # still in that in-transit state, the whole period's rate is withheld (None) rather
+    # than quoted on an incomplete outcome -- see in_transit_share / net_delivery_matured.
+    shipped_mask = sub['_shipping_date'].notna()
+    shipped_n = int(shipped_mask.sum())
+    shipped_status_counts = {s: int((sub.loc[shipped_mask, '_status'] == s).sum()) for s in STATUSES}
+    in_transit_share = (shipped_status_counts['Pending'] / shipped_n) if shipped_n else None
+    net_delivery_matured = (in_transit_share is not None and in_transit_share <= net_delivery_matured_threshold)
+    net_delivery_rate = (
+        (shipped_status_counts['Delivered'] - shipped_status_counts['Returned']) / shipped_n
+    ) if net_delivery_matured else None
+
     return {
         'total_orders': total,
         'status_counts': status_counts,
@@ -345,6 +436,10 @@ def _metrics_for_slice(sub, on_time_target_days=None):
         'delivery_time_n': delivery_n,
         'on_time_rate': on_time_rate,
         'on_time_n': on_time_n,
+        'shipped_n': shipped_n,
+        'in_transit_share': in_transit_share,
+        'net_delivery_matured': net_delivery_matured,
+        'net_delivery_rate': net_delivery_rate,
         'new_rate': new_rate,
         'returning_rate': returning_rate,
         'total_order_value': total_value,
@@ -352,16 +447,17 @@ def _metrics_for_slice(sub, on_time_target_days=None):
     }
 
 
-def compute_period_metrics(df, start_date, end_date, countries=None, on_time_target_days=None):
+def compute_period_metrics(df, start_date, end_date, countries=None, on_time_target_days=None,
+                            net_delivery_matured_threshold=DEFAULT_NET_DELIVERY_MATURED_THRESHOLD):
     """Top-level entry point for ONE period. Returns the overall metrics dict (see
     _metrics_for_slice) plus a 'per_country' dict of the same shape keyed by country
     code, and the raw filtered row count for a sanity check in the UI."""
     sub = filter_period(df, start_date, end_date, countries)
-    overall = _metrics_for_slice(sub, on_time_target_days)
+    overall = _metrics_for_slice(sub, on_time_target_days, net_delivery_matured_threshold)
     per_country = {}
     if not sub.empty:
         for country, grp in sub.groupby('_country'):
-            per_country[country] = _metrics_for_slice(grp, on_time_target_days)
+            per_country[country] = _metrics_for_slice(grp, on_time_target_days, net_delivery_matured_threshold)
     overall['per_country'] = per_country
     overall['start_date'] = pd.Timestamp(start_date).date()
     overall['end_date'] = pd.Timestamp(end_date).date()
@@ -372,13 +468,16 @@ def compute_period_metrics(df, start_date, end_date, countries=None, on_time_tar
 # Two-period comparison + rule-based Summary
 # ---------------------------------------------------------------------------
 
-def compare_periods(df, period_a, period_b, countries=None, on_time_target_days=None):
+def compare_periods(df, period_a, period_b, countries=None, on_time_target_days=None,
+                     net_delivery_matured_threshold=DEFAULT_NET_DELIVERY_MATURED_THRESHOLD):
     """period_a / period_b: (start_date, end_date) tuples. 'a' is the baseline/earlier
     period, 'b' is what it's being compared against -- deltas are always b - a, so a
     positive delta on a "higher is better" metric (e.g. delivered_rate) means period b
     improved on period a."""
-    metrics_a = compute_period_metrics(df, *period_a, countries=countries, on_time_target_days=on_time_target_days)
-    metrics_b = compute_period_metrics(df, *period_b, countries=countries, on_time_target_days=on_time_target_days)
+    metrics_a = compute_period_metrics(df, *period_a, countries=countries, on_time_target_days=on_time_target_days,
+                                        net_delivery_matured_threshold=net_delivery_matured_threshold)
+    metrics_b = compute_period_metrics(df, *period_b, countries=countries, on_time_target_days=on_time_target_days,
+                                        net_delivery_matured_threshold=net_delivery_matured_threshold)
 
     def _delta(key, a_dict, b_dict, as_pp=False):
         va, vb = a_dict.get(key), b_dict.get(key)
@@ -387,7 +486,8 @@ def compare_periods(df, period_a, period_b, countries=None, on_time_target_days=
         d = vb - va
         return d * 100 if as_pp else d
 
-    rate_keys = ['delivered_rate', 'returned_rate', 'pending_rate', 'cancelled_rate', 'on_time_rate', 'new_rate', 'returning_rate']
+    rate_keys = ['delivered_rate', 'returned_rate', 'pending_rate', 'cancelled_rate', 'on_time_rate',
+                 'net_delivery_rate', 'new_rate', 'returning_rate']
     day_keys = ['fulfillment_lead_time_days', 'delivery_time_days']
 
     def _deltas_for(a_dict, b_dict):
@@ -451,6 +551,7 @@ def generate_summary(comparison, thresholds=None):
             'returned_rate': 'returned_rate_pp',
             'pending_rate': 'pending_rate_pp',
             'on_time_rate': 'on_time_rate_pp',
+            'net_delivery_rate': 'net_delivery_rate_pp',
         }
         for metric, threshold_key in rate_metric_to_threshold.items():
             d = deltas.get(metric)
@@ -548,6 +649,7 @@ _METRIC_ROWS = [
     ('fulfillment_lead_time_days', 'Avg. fulfillment lead time (days)', 'days'),
     ('delivery_time_days', 'Avg. delivery time (days)', 'days'),
     ('on_time_rate', 'On-time delivery rate', 'pct'),
+    ('net_delivery_rate', 'Net delivery rate', 'pct'),
     ('new_rate', 'New-customer rate', 'pct'),
     ('returning_rate', 'Returning-customer rate', 'pct'),
     ('total_order_value', 'Total order value', 'money'),
@@ -579,6 +681,7 @@ _PER_COUNTRY_METRICS = [
     ('fulfillment_lead_time_days', 'Fulfillment lead time (d)', 'days'),
     ('delivery_time_days', 'Delivery time (d)', 'days'),
     ('on_time_rate', 'On-time rate', 'pct'),
+    ('net_delivery_rate', 'Net delivery rate', 'pct'),
     ('new_rate', 'New-customer rate', 'pct'),
     ('returning_rate', 'Returning-customer rate', 'pct'),
     ('total_order_value', 'Total order value', 'money'),
@@ -622,6 +725,17 @@ def _period_label(start_date, end_date):
     if start.day == 1 and end.year == start.year and end.month == start.month:
         return start.strftime('%b %Y')
     return f"{start.date()} to {end.date()}"
+
+
+def _format_on_time_target_meta(on_time_target_days):
+    """meta['on_time_target_days'] is now a per-market dict (see app.py's sidebar) --
+    renders it as 'UAE 3d, OM 10d, SA 7d, ...' for the workbook's title block instead of
+    the single flat number this used to be."""
+    if on_time_target_days is None:
+        return "not set"
+    if isinstance(on_time_target_days, dict):
+        return ', '.join(f"{c} {d}d" for c, d in sorted(on_time_target_days.items()) if d is not None) or "not set"
+    return f"{on_time_target_days} day(s)"
 
 
 def _xlsx_bytes(wb):
@@ -790,7 +904,7 @@ def export_single_period_xlsx(metrics, meta):
         'Ops Pulse -- Single period report',
         f"Order Date {metrics['start_date']} → {metrics['end_date']}",
         f"Countries: {', '.join(meta['countries'])}",
-        f"On-time delivery target: {meta['on_time_target_days']} day(s)",
+        f"On-time delivery target (per market): {_format_on_time_target_meta(meta['on_time_target_days'])}",
         f"Generated: {meta['generated_at']}",
     ])
     _, last = _write_metric_value_table(ws, r, 1, _METRIC_ROWS, metrics)
@@ -819,7 +933,7 @@ def export_comparison_xlsx(comparison, summary, meta):
         f"{label_a} (baseline): {metrics_a['start_date']} → {metrics_a['end_date']}",
         f"{label_b}: {metrics_b['start_date']} → {metrics_b['end_date']}",
         f"Countries: {', '.join(meta['countries'])}",
-        f"On-time delivery target: {meta['on_time_target_days']} day(s)",
+        f"On-time delivery target (per market): {_format_on_time_target_meta(meta['on_time_target_days'])}",
         f"Generated: {meta['generated_at']}",
     ])
     _, last = _write_comparison_metric_table(ws, r, 1, metrics_a, metrics_b, deltas, label_a, label_b)
