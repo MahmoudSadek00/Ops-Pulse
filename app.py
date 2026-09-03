@@ -281,7 +281,7 @@ def render_metric_cards(metrics, delta_metrics=None):
     c7.metric("Avg. delivery time", _days(metrics['delivery_time_days']),
                delta=(f"{delta_metrics['delivery_time_days']:+.1f}d" if delta_metrics and delta_metrics.get('delivery_time_days') is not None else None),
                delta_color=_dc('delivery_time_days'),
-               help=f"n={metrics['delivery_time_n']:,} Delivered orders with both an Order Date and a Delivery Date.")
+               help=f"Shipping Date -> Delivery Date (the shipping leg only, not time spent before it shipped). n={metrics['delivery_time_n']:,} Delivered orders with both dates.")
     # Delivery Time's band is per-market (the window varies by country -- see
     # DEFAULT_DELIVERY_WINDOWS), so it's only meaningful here when exactly one market is
     # selected; with several markets mixed together, the average can't be banded against
