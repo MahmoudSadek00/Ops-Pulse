@@ -12,6 +12,7 @@ from logic import (
     DEFAULT_WEAK_POINT_THRESHOLDS, STAGING_SPREADSHEET_ID_DEFAULT,
     get_client, load_orders_data, compute_period_metrics, compare_periods, generate_summary,
     export_single_period_xlsx, export_comparison_xlsx, classify_band, classify_delivery_time_band,
+    per_country_kpi_rows,
 )
 
 st.set_page_config(page_title="Ops Pulse", layout="wide")
@@ -377,28 +378,33 @@ def per_country_rate_chart(metrics, rate_key, title):
 def per_country_kpi_table(metrics):
     """One row per market with Net Delivery Rate / On-Time Delivery Rate / Delivery
     Time, each next to its Below/Target/Exceed band -- the on-screen equivalent of the
-    CEO scorecard's 3 logistics KPI rows, market by market (Sep 2026)."""
+    CEO scorecard's 3 logistics KPI rows, market by market (Sep 2026). Built from
+    logic.per_country_kpi_rows() -- the SAME function the xlsx export's "Logistics
+    KPIs" sheet calls, so the table on screen and the one in the download can never
+    silently drift apart; this just adds the emoji captions/formatting for display."""
+    raw_rows = per_country_kpi_rows(
+        metrics, delivery_windows,
+        (on_time_target_pct, on_time_exceed_pct),
+        (net_delivery_target_pct, net_delivery_exceed_pct),
+    )
     rows = []
-    for c, m in sorted(metrics['per_country'].items()):
-        window = delivery_windows.get(c)
-        nd_band = classify_band(m['net_delivery_rate'], net_delivery_target_pct, net_delivery_exceed_pct)
-        ot_band = classify_band(m['on_time_rate'], on_time_target_pct, on_time_exceed_pct)
-        dt_band = classify_delivery_time_band(m['delivery_time_days'], window)
-        if m.get('net_delivery_matured'):
-            nd_display = _pct(m['net_delivery_rate'])
-        elif m.get('shipped_n'):
-            nd_display = f"⏳ {m['in_transit_share']*100:.0f}% in transit"
+    for row in raw_rows:
+        window = row['delivery_window']
+        if row['net_delivery_matured']:
+            nd_display = _pct(row['net_delivery_rate'])
+        elif row.get('shipped_n'):
+            nd_display = f"⏳ {(row.get('in_transit_share') or 0)*100:.0f}% in transit"
         else:
             nd_display = "—"
         rows.append({
-            'Country': c,
+            'Country': row['country'],
             'Net delivery rate': nd_display,
-            'ND band': _band_caption(nd_band) or '—',
-            'On-time rate': _pct(m['on_time_rate']),
-            'OT band': _band_caption(ot_band) or '—',
-            'Delivery time': _days(m['delivery_time_days']),
+            'ND band': _band_caption(row['net_delivery_band']) or '—',
+            'On-time rate': _pct(row['on_time_rate']),
+            'OT band': _band_caption(row['on_time_band']) or '—',
+            'Delivery time': _days(row['delivery_time_days']),
             'Window': f"{window[0]}–{window[1]}d" if window else '—',
-            'DT band': _band_caption(dt_band) or '—',
+            'DT band': _band_caption(row['delivery_time_band']) or '—',
         })
     return pd.DataFrame(rows)
 
@@ -434,6 +440,12 @@ def comparison_bar_chart(comparison, rate_key, title, as_pct=True):
 export_meta = {
     'countries': countries,
     'on_time_target_days': on_time_target_days,
+    # Sep 2026: so the downloaded .xlsx carries the same Below/Target/Exceed bands (and
+    # the "Logistics KPIs" sheet) shown on screen, not just the raw numbers -- see
+    # logic.py's export_single_period_xlsx / export_comparison_xlsx / per_country_kpi_rows.
+    'delivery_windows': delivery_windows,
+    'on_time_bands': (on_time_target_pct, on_time_exceed_pct),
+    'net_delivery_bands': (net_delivery_target_pct, net_delivery_exceed_pct),
     'generated_at': dt.datetime.now().strftime('%Y-%m-%d %H:%M'),
 }
 
