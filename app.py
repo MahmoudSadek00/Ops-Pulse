@@ -7,10 +7,11 @@ import plotly.express as px
 import plotly.graph_objects as go
 
 from logic import (
-    STATUSES, METRIC_LABELS, METRIC_DIRECTION, DEFAULT_ON_TIME_TARGET_DAYS,
+    STATUSES, METRIC_LABELS, METRIC_DIRECTION,
+    DEFAULT_DELIVERY_WINDOWS, DEFAULT_KPI_BANDS, DEFAULT_NET_DELIVERY_MATURED_THRESHOLD,
     DEFAULT_WEAK_POINT_THRESHOLDS, STAGING_SPREADSHEET_ID_DEFAULT,
     get_client, load_orders_data, compute_period_metrics, compare_periods, generate_summary,
-    export_single_period_xlsx, export_comparison_xlsx,
+    export_single_period_xlsx, export_comparison_xlsx, classify_band, classify_delivery_time_band,
 )
 
 st.set_page_config(page_title="Ops Pulse", layout="wide")
@@ -36,6 +37,20 @@ PERIOD_A_COLOR = '#5C6BC0'
 PERIOD_B_COLOR = '#2E7D32'
 
 ALL_COUNTRIES = ['UAE', 'OM', 'SA', 'KW', 'QA', 'IQ']
+# Markets the CEO scorecard has a transit window for -- Iraq is deliberately absent
+# (see DEFAULT_DELIVERY_WINDOWS in logic.py) until Delivery Date is captured there.
+WINDOWED_COUNTRIES = ['UAE', 'OM', 'SA', 'QA', 'KW']
+
+BAND_EMOJI = {'below': '🔴', 'target': '🟢', 'exceed': '🟣'}
+BAND_TEXT = {'below': 'Below target', 'target': 'On target', 'exceed': 'Exceeding target'}
+
+
+def _band_caption(band):
+    """band: 'below'/'target'/'exceed'/None (see logic.classify_band /
+    classify_delivery_time_band). Returns a short emoji + text label, or None."""
+    if band is None:
+        return None
+    return f"{BAND_EMOJI[band]} {BAND_TEXT[band]}"
 
 
 # ---------------------------------------------------------------------------
@@ -167,14 +182,41 @@ with st.sidebar:
 
     with st.expander("Advanced settings"):
         st.caption(
-            "On-time delivery target: a placeholder (5 days) until the CEO scorecard's "
-            "real per-market transit windows are plugged in here -- applies to every "
-            "market equally for now."
+            "Per-market delivery windows (days, Shipping Date → Delivery Date) -- "
+            "defaults are the CEO Q3 2026 scorecard's own numbers. The High day doubles "
+            "as On-Time Delivery Rate's target for that market (delivered within it = "
+            "on-time); Low is only used for Delivery Time's own Below/Target/Exceed "
+            "band. Iraq has no window yet (Delivery Date isn't captured there) -- "
+            "excluded from On-Time Delivery Rate and Delivery Time bands until it is."
         )
-        on_time_target = st.number_input(
-            "On-time delivery target (days from Order Date)",
-            min_value=1, max_value=60, value=DEFAULT_ON_TIME_TARGET_DAYS,
+        delivery_windows = {}
+        for c in WINDOWED_COUNTRIES:
+            lo_default, hi_default = DEFAULT_DELIVERY_WINDOWS[c]
+            wcol1, wcol2 = st.columns(2)
+            lo = wcol1.number_input(f"{c} -- Low (d)", min_value=1, max_value=60, value=lo_default, key=f"win_lo_{c}")
+            hi = wcol2.number_input(f"{c} -- High (d)", min_value=lo, max_value=60, value=max(hi_default, lo), key=f"win_hi_{c}")
+            delivery_windows[c] = (lo, hi)
+        on_time_target_days = {c: hi for c, (lo, hi) in delivery_windows.items()}
+
+        st.caption(
+            "Net Delivery Rate's \"matured cohort\" gate (CEO scorecard: \"no rate "
+            "quoted while >10% in transit\") -- the share of a period's Shipped orders "
+            "still Pending (in transit) has to be at or under this before the rate is "
+            "quoted at all; otherwise it's flagged as not-yet-matured instead of shown."
         )
+        net_delivery_matured_threshold = st.number_input(
+            "Max share still in transit to quote the rate (%)",
+            min_value=1.0, max_value=100.0, value=DEFAULT_NET_DELIVERY_MATURED_THRESHOLD * 100, step=1.0,
+        ) / 100.0
+
+        st.caption("Below / Target / Exceed cutoffs (CEO Q3 2026 scorecard) -- everything under Target counts as Below.")
+        bc1, bc2 = st.columns(2)
+        on_time_target_pct = bc1.number_input("On-time rate -- Target (%)", 50.0, 100.0, DEFAULT_KPI_BANDS['on_time_rate']['target'] * 100, 0.5) / 100.0
+        on_time_exceed_pct = bc2.number_input("On-time rate -- Exceed (%)", 50.0, 100.0, DEFAULT_KPI_BANDS['on_time_rate']['exceed'] * 100, 0.5) / 100.0
+        nc1, nc2 = st.columns(2)
+        net_delivery_target_pct = nc1.number_input("Net delivery rate -- Target (%)", 50.0, 100.0, DEFAULT_KPI_BANDS['net_delivery_rate']['target'] * 100, 0.5) / 100.0
+        net_delivery_exceed_pct = nc2.number_input("Net delivery rate -- Exceed (%)", 50.0, 100.0, DEFAULT_KPI_BANDS['net_delivery_rate']['exceed'] * 100, 0.5) / 100.0
+
         st.caption("Weak-point thresholds -- how much worse than the baseline period counts as a weak point.")
         thresholds = {}
         thresholds['delivered_rate_pp'] = st.number_input("Delivered rate drop (pp)", 0.5, 20.0, DEFAULT_WEAK_POINT_THRESHOLDS['delivered_rate_pp'], 0.5)
@@ -184,6 +226,7 @@ with st.sidebar:
         thresholds['fulfillment_lead_time_days'] = st.number_input("Fulfillment lead time slowdown (days)", 0.1, 10.0, DEFAULT_WEAK_POINT_THRESHOLDS['fulfillment_lead_time_days'], 0.1)
         thresholds['delivery_time_days'] = st.number_input("Delivery time slowdown (days)", 0.1, 10.0, DEFAULT_WEAK_POINT_THRESHOLDS['delivery_time_days'], 0.1)
         thresholds['on_time_rate_pp'] = st.number_input("On-time rate drop (pp)", 0.5, 20.0, DEFAULT_WEAK_POINT_THRESHOLDS['on_time_rate_pp'], 0.5)
+        thresholds['net_delivery_rate_pp'] = st.number_input("Net delivery rate drop (pp)", 0.5, 20.0, DEFAULT_WEAK_POINT_THRESHOLDS['net_delivery_rate_pp'], 0.5)
 
 if not countries:
     st.warning("Pick at least one country/market in the sidebar.")
@@ -239,10 +282,44 @@ def render_metric_cards(metrics, delta_metrics=None):
                delta=(f"{delta_metrics['delivery_time_days']:+.1f}d" if delta_metrics and delta_metrics.get('delivery_time_days') is not None else None),
                delta_color=_dc('delivery_time_days'),
                help=f"n={metrics['delivery_time_n']:,} Delivered orders with both an Order Date and a Delivery Date.")
+    # Delivery Time's band is per-market (the window varies by country -- see
+    # DEFAULT_DELIVERY_WINDOWS), so it's only meaningful here when exactly one market is
+    # selected; with several markets mixed together, the average can't be banded against
+    # any single window without being misleading. The per-country table below always
+    # shows it market-by-market regardless.
+    if len(countries) == 1 and countries[0] in delivery_windows:
+        dt_band = classify_delivery_time_band(metrics['delivery_time_days'], delivery_windows[countries[0]])
+        cap = _band_caption(dt_band)
+        if cap:
+            c7.caption(cap)
     c8.metric("On-time delivery rate", _pct(metrics['on_time_rate']),
                delta=(f"{delta_metrics['on_time_rate']:+.1f}pp" if delta_metrics and delta_metrics.get('on_time_rate') is not None else None),
                delta_color=_dc('on_time_rate'),
-               help=f"Against a {on_time_target}-day target. n={metrics['on_time_n']:,}.")
+               help=f"Against each market's own transit window. n={metrics['on_time_n']:,}.")
+    cap = _band_caption(classify_band(metrics['on_time_rate'], on_time_target_pct, on_time_exceed_pct))
+    if cap:
+        c8.caption(cap)
+
+    c8b, c8c = st.columns(2)
+    if metrics.get('net_delivery_matured'):
+        c8b.metric("Net delivery rate", _pct(metrics['net_delivery_rate']),
+                    delta=(f"{delta_metrics['net_delivery_rate']:+.1f}pp" if delta_metrics and delta_metrics.get('net_delivery_rate') is not None else None),
+                    delta_color=_dc('net_delivery_rate'),
+                    help="(Delivered − Returned) ÷ Shipped, matured cohorts only. "
+                         f"n={metrics['shipped_n']:,} Shipped orders.")
+        cap = _band_caption(classify_band(metrics['net_delivery_rate'], net_delivery_target_pct, net_delivery_exceed_pct))
+        if cap:
+            c8b.caption(cap)
+    else:
+        share = metrics.get('in_transit_share')
+        c8b.metric("Net delivery rate", "—")
+        c8b.caption(
+            f"⏳ Not matured yet -- {share*100:.0f}% of Shipped orders still in transit."
+            if share is not None else "⏳ No Shipped orders in this period yet."
+        )
+    c8c.metric("Shipped orders", f"{metrics['shipped_n']:,}", help="Orders with a Shipping Date -- reached the shipping company, regardless of outcome yet.")
+    if metrics.get('in_transit_share') is not None:
+        c8c.caption(f"{metrics['in_transit_share']*100:.1f}% still in transit (Pending)")
 
     c9, c10, c11, c12 = st.columns(4)
     c9.metric("New-customer rate", _pct(metrics['new_rate']),
@@ -297,6 +374,35 @@ def per_country_rate_chart(metrics, rate_key, title):
     return fig
 
 
+def per_country_kpi_table(metrics):
+    """One row per market with Net Delivery Rate / On-Time Delivery Rate / Delivery
+    Time, each next to its Below/Target/Exceed band -- the on-screen equivalent of the
+    CEO scorecard's 3 logistics KPI rows, market by market (Sep 2026)."""
+    rows = []
+    for c, m in sorted(metrics['per_country'].items()):
+        window = delivery_windows.get(c)
+        nd_band = classify_band(m['net_delivery_rate'], net_delivery_target_pct, net_delivery_exceed_pct)
+        ot_band = classify_band(m['on_time_rate'], on_time_target_pct, on_time_exceed_pct)
+        dt_band = classify_delivery_time_band(m['delivery_time_days'], window)
+        if m.get('net_delivery_matured'):
+            nd_display = _pct(m['net_delivery_rate'])
+        elif m.get('shipped_n'):
+            nd_display = f"⏳ {m['in_transit_share']*100:.0f}% in transit"
+        else:
+            nd_display = "—"
+        rows.append({
+            'Country': c,
+            'Net delivery rate': nd_display,
+            'ND band': _band_caption(nd_band) or '—',
+            'On-time rate': _pct(m['on_time_rate']),
+            'OT band': _band_caption(ot_band) or '—',
+            'Delivery time': _days(m['delivery_time_days']),
+            'Window': f"{window[0]}–{window[1]}d" if window else '—',
+            'DT band': _band_caption(dt_band) or '—',
+        })
+    return pd.DataFrame(rows)
+
+
 def comparison_bar_chart(comparison, rate_key, title, as_pct=True):
     countries_here = sorted(set(comparison['period_a']['per_country']) | set(comparison['period_b']['per_country']))
     rows = []
@@ -327,12 +433,30 @@ def comparison_bar_chart(comparison, rate_key, title, as_pct=True):
 
 export_meta = {
     'countries': countries,
-    'on_time_target_days': on_time_target,
+    'on_time_target_days': on_time_target_days,
     'generated_at': dt.datetime.now().strftime('%Y-%m-%d %H:%M'),
 }
 
+# Single-country selections can band Delivery Time (and the "Overall deltas" table's
+# Delivery Time row, in comparison mode) against that one market's own window -- with
+# several markets mixed together the average can't be banded against any one window.
+_single_country = countries[0] if len(countries) == 1 else None
+
+
+def _band_for_metric(key, value):
+    if key == 'on_time_rate':
+        return _band_caption(classify_band(value, on_time_target_pct, on_time_exceed_pct))
+    if key == 'net_delivery_rate':
+        return _band_caption(classify_band(value, net_delivery_target_pct, net_delivery_exceed_pct))
+    if key == 'delivery_time_days' and _single_country in delivery_windows:
+        return _band_caption(classify_delivery_time_band(value, delivery_windows[_single_country]))
+    return None
+
+
 if mode == "Single period":
-    metrics = compute_period_metrics(df, start_date, end_date, countries=countries, on_time_target_days=on_time_target)
+    metrics = compute_period_metrics(df, start_date, end_date, countries=countries,
+                                      on_time_target_days=on_time_target_days,
+                                      net_delivery_matured_threshold=net_delivery_matured_threshold)
 
     st.download_button(
         "⬇️ Download this report as Excel",
@@ -345,6 +469,14 @@ if mode == "Single period":
     with tab_overview:
         st.subheader(f"{start_date} → {end_date}")
         render_metric_cards(metrics)
+
+        st.subheader("Logistics KPIs by market -- vs. the CEO scorecard's bands")
+        kpi_table = per_country_kpi_table(metrics)
+        if not kpi_table.empty:
+            st.dataframe(kpi_table, use_container_width=True, hide_index=True)
+        else:
+            st.caption("No markets in this selection have data for the period.")
+
         col1, col2 = st.columns(2)
         with col1:
             st.plotly_chart(status_breakdown_chart(metrics, "Orders by status"), use_container_width=True)
@@ -361,10 +493,21 @@ if mode == "Single period":
             fig = per_country_rate_chart(metrics, 'returned_rate', "Returned rate by country")
             if fig:
                 st.plotly_chart(fig, use_container_width=True)
+        col5, col6 = st.columns(2)
+        with col5:
+            fig = per_country_rate_chart(metrics, 'on_time_rate', "On-time delivery rate by country")
+            if fig:
+                st.plotly_chart(fig, use_container_width=True)
+        with col6:
+            fig = per_country_rate_chart(metrics, 'net_delivery_rate', "Net delivery rate by country")
+            if fig:
+                st.plotly_chart(fig, use_container_width=True)
 
 else:
     comparison = compare_periods(
-        df, (a_start, a_end), (b_start, b_end), countries=countries, on_time_target_days=on_time_target,
+        df, (a_start, a_end), (b_start, b_end), countries=countries,
+        on_time_target_days=on_time_target_days,
+        net_delivery_matured_threshold=net_delivery_matured_threshold,
     )
     metrics_a, metrics_b, deltas = comparison['period_a'], comparison['period_b'], comparison['deltas']
     summary = generate_summary(comparison, thresholds=thresholds)
@@ -381,6 +524,16 @@ else:
     with tab_overview:
         st.subheader(f"Period B: {b_start} → {b_end}  (vs. Period A: {a_start} → {a_end})")
         render_metric_cards(metrics_b, delta_metrics=deltas)
+
+        st.subheader("Logistics KPIs by market -- Period B, vs. the CEO scorecard's bands")
+        kpi_table_b = per_country_kpi_table(metrics_b)
+        if not kpi_table_b.empty:
+            st.dataframe(kpi_table_b, use_container_width=True, hide_index=True)
+        with st.expander("Same table for Period A (baseline)"):
+            kpi_table_a = per_country_kpi_table(metrics_a)
+            if not kpi_table_a.empty:
+                st.dataframe(kpi_table_a, use_container_width=True, hide_index=True)
+
         col1, col2 = st.columns(2)
         with col1:
             st.plotly_chart(status_breakdown_chart(metrics_a, f"Period A ({a_start} → {a_end}) -- by status"), use_container_width=True)
@@ -392,22 +545,41 @@ else:
         for rate_key, label in [
             ('delivered_rate', 'Delivered rate'), ('cancelled_rate', 'Cancelled rate'),
             ('returned_rate', 'Returned rate'), ('pending_rate', 'Pending rate'),
+            ('on_time_rate', 'On-time delivery rate'), ('net_delivery_rate', 'Net delivery rate'),
         ]:
             fig = comparison_bar_chart(comparison, rate_key, f"{label} by country -- A vs B")
             if fig:
                 st.plotly_chart(fig, use_container_width=True)
 
         st.subheader("Overall deltas (Period B − Period A)")
+        st.caption(
+            "Trend AND target status together: the Delta column says whether it moved "
+            "in the right direction, the band columns say whether each period actually "
+            "hit the CEO scorecard's target -- a metric can improve and still be Below "
+            "target, or decline and still be On target."
+        )
         delta_rows = []
         for key, label in METRIC_LABELS.items():
             d = deltas.get(key)
             if d is None:
                 continue
             unit = 'pp' if key.endswith('_rate') else 'days'
-            delta_rows.append({'Metric': label, 'Period A': metrics_a.get(key), 'Period B': metrics_b.get(key),
-                                'Delta': d, 'Unit': unit})
+            direction = METRIC_DIRECTION.get(key, 1)
+            trend = ('↑ improving' if d * direction > 0 else '↓ declining') if d != 0 else '— flat'
+            delta_rows.append({
+                'Metric': label,
+                'Period A': metrics_a.get(key), 'Period A band': _band_for_metric(key, metrics_a.get(key)) or '—',
+                'Period B': metrics_b.get(key), 'Period B band': _band_for_metric(key, metrics_b.get(key)) or '—',
+                'Delta': d, 'Unit': unit, 'Trend': trend,
+            })
         if delta_rows:
             st.dataframe(pd.DataFrame(delta_rows), use_container_width=True, hide_index=True)
+        if _single_country is None:
+            st.caption(
+                "Delivery Time's band needs one market at a time (its window differs by "
+                "market) -- pick a single country in the sidebar to see it banded here, "
+                "or check the per-market tables above/below."
+            )
 
     with tab_summary:
         st.subheader("✅ What's working")
