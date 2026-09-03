@@ -170,6 +170,44 @@ def classify_band(value, target, exceed):
     return 'below'
 
 
+BAND_LABELS = {'below': 'Below target', 'target': 'On target', 'exceed': 'Exceeding target'}
+
+
+def per_country_kpi_rows(metrics, delivery_windows, on_time_bands, net_delivery_bands):
+    """One row per market combining Net Delivery Rate / On-Time Delivery Rate /
+    Delivery Time with their CEO-scorecard Below/Target/Exceed bands. THE single source
+    of truth for this breakdown -- both app.py's on-screen "Logistics KPIs by market"
+    table AND the xlsx export's own "Logistics KPIs" sheet call this same function (Sep
+    2026, per Mahmoud: the bands shown on screen need to actually be in the download
+    too, not just the raw numbers -- computing them in one place instead of twice is
+    what keeps the two views from ever silently drifting apart).
+    metrics: a compute_period_metrics() return value (has 'per_country').
+    delivery_windows: {country: (low, high)} (see DEFAULT_DELIVERY_WINDOWS).
+    on_time_bands / net_delivery_bands: (target, exceed) tuples (see DEFAULT_KPI_BANDS).
+    """
+    ot_target, ot_exceed = on_time_bands
+    nd_target, nd_exceed = net_delivery_bands
+    rows = []
+    for country in sorted(metrics.get('per_country', {})):
+        m = metrics['per_country'][country]
+        window = delivery_windows.get(country)
+        matured = m.get('net_delivery_matured')
+        rows.append({
+            'country': country,
+            'net_delivery_rate': m.get('net_delivery_rate') if matured else None,
+            'net_delivery_matured': matured,
+            'in_transit_share': m.get('in_transit_share'),
+            'shipped_n': m.get('shipped_n'),
+            'net_delivery_band': classify_band(m.get('net_delivery_rate'), nd_target, nd_exceed) if matured else None,
+            'on_time_rate': m.get('on_time_rate'),
+            'on_time_band': classify_band(m.get('on_time_rate'), ot_target, ot_exceed),
+            'delivery_time_days': m.get('delivery_time_days'),
+            'delivery_window': window,
+            'delivery_time_band': classify_delivery_time_band(m.get('delivery_time_days'), window),
+        })
+    return rows
+
+
 def classify_delivery_time_band(avg_days, window):
     """window: (low, high) from DEFAULT_DELIVERY_WINDOWS (or the sidebar's adjusted
     version) for ONE market -- Delivery Time is the only KPI here where 'Target' is a
@@ -648,6 +686,16 @@ _XLSX_BODY_FONT = Font(name='Arial')
 _XLSX_TITLE_FONT = Font(name='Arial', bold=True, size=13)
 _XLSX_SUBTITLE_FONT = Font(name='Arial', italic=True, color='555555')
 
+# Light background fills for Below/Target/Exceed band cells (Sep 2026) -- same
+# red/green/purple language as the Streamlit app's 🔴/🟢/🟣 captions, just as a cell
+# fill instead of an emoji (Excel/Google Sheets render emoji fine too, but a fill reads
+# at a glance across a whole table the way the on-screen captions do one card at a time).
+_BAND_FILLS = {
+    'below': PatternFill(start_color='FBE1E1', end_color='FBE1E1', fill_type='solid'),
+    'target': PatternFill(start_color='E2F3E5', end_color='E2F3E5', fill_type='solid'),
+    'exceed': PatternFill(start_color='E9E2F7', end_color='E9E2F7', fill_type='solid'),
+}
+
 # (key, label, kind) -- same set/order as app.py's render_metric_cards(), kind picks
 # the cell's Excel number_format so rates render as %, money as thousands-separated,
 # etc. (matching how the Streamlit metric cards display them).
@@ -781,26 +829,51 @@ def _write_header_row(ws, row, left_col, headers):
         ws.column_dimensions[letter].width = max(wanted, current) if current else wanted
 
 
-def _write_metric_value_table(ws, top_row, left_col, metric_defs, metrics):
-    """Metric | Value table -- one row per (key, label, kind) in metric_defs, value
-    pulled from metrics[key]. Returns (first_data_row, last_data_row)."""
-    _write_header_row(ws, top_row, left_col, ['Metric', 'Value'])
+def _write_band_cell(ws, row, col, band):
+    """Writes one Band cell (BAND_LABELS text + matching _BAND_FILLS colour), or '—' with
+    no fill if band is None (metric not bandable here -- e.g. no window configured)."""
+    cell = ws.cell(row=row, column=col, value=BAND_LABELS.get(band, '—'))
+    cell.font = _XLSX_BODY_FONT
+    if band in _BAND_FILLS:
+        cell.fill = _BAND_FILLS[band]
+    return cell
+
+
+def _write_metric_value_table(ws, top_row, left_col, metric_defs, metrics, band_fn=None):
+    """Metric | Value [| Band] table -- one row per (key, label, kind) in metric_defs,
+    value pulled from metrics[key]. band_fn(key, value) -> 'below'/'target'/'exceed'/None
+    (Sep 2026) adds a 3rd Band column, colour-filled to match the on-screen captions --
+    omit it for metrics with no CEO-scorecard band (most of them). Returns
+    (first_data_row, last_data_row)."""
+    headers = ['Metric', 'Value'] + (['Band'] if band_fn else [])
+    _write_header_row(ws, top_row, left_col, headers)
     r = top_row + 1
     for key, label, kind in metric_defs:
         ws.cell(row=r, column=left_col, value=label).font = _XLSX_BODY_FONT
         val_cell = ws.cell(row=r, column=left_col + 1, value=metrics.get(key))
         val_cell.font = _XLSX_BODY_FONT
         val_cell.number_format = _NUMBER_FORMATS[kind]
+        if band_fn:
+            _write_band_cell(ws, r, left_col + 2, band_fn(key, metrics.get(key)))
         r += 1
     ws.column_dimensions[get_column_letter(left_col)].width = 36
     return top_row + 1, r - 1
 
 
-def _write_comparison_metric_table(ws, top_row, left_col, metrics_a, metrics_b, deltas, label_a, label_b):
-    """Metric | <label A> | <label B> | Delta | Unit -- same rows as app.py's Comparison
-    tab 'Overall deltas' table. label_a/label_b: human period labels (see
-    _period_label()) shown instead of the generic 'Period A'/'Period B'."""
-    _write_header_row(ws, top_row, left_col, ['Metric', label_a, label_b, 'Delta', 'Unit'])
+def _write_comparison_metric_table(ws, top_row, left_col, metrics_a, metrics_b, deltas, label_a, label_b, band_fn=None):
+    """Metric | <label A> [| A band] | <label B> [| B band] | Delta | Unit [| Trend] --
+    same rows as app.py's Comparison tab 'Overall deltas' table. label_a/label_b: human
+    period labels (see _period_label()) shown instead of the generic 'Period A'/'Period
+    B'. band_fn(key, value) -> band or None (Sep 2026): when given, adds a Band column
+    next to EACH period's value (so a metric can read "Below target" for A and "On
+    target" for B, or vice versa) plus a Trend column (Improving/Declining/Flat, from
+    the SAME delta/direction logic as the Delta column -- trend and target-achievement
+    are 2 separate questions, answered side by side rather than one standing in for the
+    other; see app.py's Comparison tab caption for the same idea on screen)."""
+    headers = ['Metric', label_a] + ([f'{label_a} band'] if band_fn else []) \
+        + [label_b] + ([f'{label_b} band'] if band_fn else []) + ['Delta', 'Unit'] \
+        + (['Trend'] if band_fn else [])
+    _write_header_row(ws, top_row, left_col, headers)
     r = top_row + 1
     for key, label in METRIC_LABELS.items():
         d = deltas.get(key)
@@ -808,15 +881,27 @@ def _write_comparison_metric_table(ws, top_row, left_col, metrics_a, metrics_b, 
             continue
         kind = 'pct' if key.endswith('_rate') else 'days'
         unit = 'pp' if kind == 'pct' else 'days'
+        va, vb = metrics_a.get(key), metrics_b.get(key)
         ws.cell(row=r, column=left_col, value=label).font = _XLSX_BODY_FONT
-        for offset, val in ((1, metrics_a.get(key)), (2, metrics_b.get(key))):
-            cell = ws.cell(row=r, column=left_col + offset, value=val)
+        col = left_col + 1
+        for val in (va, vb):
+            cell = ws.cell(row=r, column=col, value=val)
             cell.font = _XLSX_BODY_FONT
             cell.number_format = _NUMBER_FORMATS[kind]
-        delta_cell = ws.cell(row=r, column=left_col + 3, value=d / 100 if kind == 'pct' else d)
+            col += 1
+            if band_fn:
+                _write_band_cell(ws, r, col, band_fn(key, val))
+                col += 1
+        delta_cell = ws.cell(row=r, column=col, value=d / 100 if kind == 'pct' else d)
         delta_cell.font = _XLSX_BODY_FONT
         delta_cell.number_format = '+0.0%;-0.0%' if kind == 'pct' else '+0.0"d";-0.0"d"'
-        ws.cell(row=r, column=left_col + 4, value=unit).font = _XLSX_BODY_FONT
+        col += 1
+        ws.cell(row=r, column=col, value=unit).font = _XLSX_BODY_FONT
+        col += 1
+        if band_fn:
+            direction = METRIC_DIRECTION.get(key, 1)
+            trend = ('Improving' if d * direction > 0 else 'Declining') if d != 0 else 'Flat'
+            ws.cell(row=r, column=col, value=trend).font = _XLSX_BODY_FONT
         r += 1
     ws.column_dimensions[get_column_letter(left_col)].width = 34
     return top_row + 1, r - 1
@@ -904,10 +989,87 @@ def _write_per_country_sheet(ws, per_country, title):
         anchor_col += 8
 
 
+def _write_kpi_band_table(ws, top_row, left_col, rows, title):
+    """Writes per_country_kpi_rows()'s output as one table: Country | Net delivery rate
+    | ND band | On-time rate | OT band | Delivery time (d) | Window | DT band -- the
+    xlsx twin of app.py's on-screen "Logistics KPIs by market" table (Sep 2026), same
+    columns, same band colours. Returns the next free row (for stacking a 2nd table,
+    e.g. Period A then Period B, below this one)."""
+    ws.cell(row=top_row, column=left_col, value=title).font = _XLSX_SUBTITLE_FONT
+    header_row = top_row + 1
+    _write_header_row(ws, header_row, left_col, [
+        'Country', 'Net delivery rate', 'ND band', 'On-time rate', 'OT band',
+        'Delivery time (d)', 'Window', 'DT band',
+    ])
+    r = header_row + 1
+    for row in rows:
+        window = row['delivery_window']
+        ws.cell(row=r, column=left_col, value=row['country']).font = _XLSX_BODY_FONT
+
+        nd_cell = ws.cell(row=r, column=left_col + 1)
+        nd_cell.font = _XLSX_BODY_FONT
+        if row['net_delivery_matured']:
+            nd_cell.value = row['net_delivery_rate']
+            nd_cell.number_format = _NUMBER_FORMATS['pct']
+        elif row.get('shipped_n'):
+            nd_cell.value = f"{(row.get('in_transit_share') or 0) * 100:.0f}% in transit"
+        _write_band_cell(ws, r, left_col + 2, row['net_delivery_band'])
+
+        ot_cell = ws.cell(row=r, column=left_col + 3, value=row['on_time_rate'])
+        ot_cell.font = _XLSX_BODY_FONT
+        ot_cell.number_format = _NUMBER_FORMATS['pct']
+        _write_band_cell(ws, r, left_col + 4, row['on_time_band'])
+
+        dt_cell = ws.cell(row=r, column=left_col + 5, value=row['delivery_time_days'])
+        dt_cell.font = _XLSX_BODY_FONT
+        dt_cell.number_format = _NUMBER_FORMATS['days']
+        ws.cell(row=r, column=left_col + 6,
+                value=(f"{window[0]}–{window[1]}d" if window else '—')).font = _XLSX_BODY_FONT
+        _write_band_cell(ws, r, left_col + 7, row['delivery_time_band'])
+        r += 1
+
+    for i in range(8):
+        letter = get_column_letter(left_col + i)
+        wanted = 18
+        current = ws.column_dimensions[letter].width
+        ws.column_dimensions[letter].width = max(wanted, current) if current else wanted
+    return r + 1
+
+
+def _band_fn_from_meta(meta):
+    """Builds a band_fn(key, value) -> band closure from meta's 'delivery_windows',
+    'on_time_bands', 'net_delivery_bands' (Sep 2026 -- see app.py's export_meta). Any of
+    the 3 missing from meta just means that metric won't be banded (returns None for
+    it) -- lets both export functions stay callable even if a caller doesn't pass the
+    new keys. delivery_time_days only bands when exactly one country is selected (its
+    window varies by market -- see app.py's _single_country for the same rule on
+    screen)."""
+    delivery_windows = meta.get('delivery_windows') or {}
+    on_time_bands = meta.get('on_time_bands')
+    net_delivery_bands = meta.get('net_delivery_bands')
+    countries = meta.get('countries') or []
+    single_country = countries[0] if len(countries) == 1 else None
+
+    def band_fn(key, value):
+        if key == 'on_time_rate' and on_time_bands:
+            return classify_band(value, *on_time_bands)
+        if key == 'net_delivery_rate' and net_delivery_bands:
+            return classify_band(value, *net_delivery_bands)
+        if key == 'delivery_time_days' and single_country in delivery_windows:
+            return classify_delivery_time_band(value, delivery_windows[single_country])
+        return None
+    return band_fn
+
+
 def export_single_period_xlsx(metrics, meta):
     """metrics: compute_period_metrics()'s return value. meta: dict with 'countries'
-    (list), 'on_time_target_days', 'generated_at' (str). Returns .xlsx bytes with the
-    same numbers/breakdown as the Overview tab in "Single period" mode."""
+    (list), 'on_time_target_days', 'generated_at' (str), plus (Sep 2026, so the
+    Below/Target/Exceed bands shown on screen make it into the download too --
+    optional, omitting them just means no Band column/sheet) 'delivery_windows'
+    ({country: (low, high)}), 'on_time_bands' / 'net_delivery_bands' ((target, exceed)
+    tuples). Returns .xlsx bytes with the same numbers/breakdown/bands as the Overview
+    tab in "Single period" mode."""
+    band_fn = _band_fn_from_meta(meta)
     wb = Workbook()
     ws = wb.active
     ws.title = 'Overview'
@@ -918,20 +1080,31 @@ def export_single_period_xlsx(metrics, meta):
         f"On-time delivery target (per market): {_format_on_time_target_meta(meta['on_time_target_days'])}",
         f"Generated: {meta['generated_at']}",
     ])
-    _, last = _write_metric_value_table(ws, r, 1, _METRIC_ROWS, metrics)
+    _, last = _write_metric_value_table(ws, r, 1, _METRIC_ROWS, metrics, band_fn=band_fn)
     _write_status_table_and_chart(ws, last + 3, 1, metrics, 'Orders by status')
 
     ws2 = wb.create_sheet('Per Country')
     _write_per_country_sheet(ws2, metrics['per_country'], f"{metrics['start_date']} → {metrics['end_date']} -- by country")
+
+    if meta.get('on_time_bands') and meta.get('net_delivery_bands'):
+        ws3 = wb.create_sheet('Logistics KPIs')
+        rows = per_country_kpi_rows(metrics, meta.get('delivery_windows') or {}, meta['on_time_bands'], meta['net_delivery_bands'])
+        _write_kpi_band_table(ws3, 1, 1, rows,
+                               f"{metrics['start_date']} → {metrics['end_date']} -- Net/On-time delivery vs. CEO scorecard bands")
 
     return _xlsx_bytes(wb)
 
 
 def export_comparison_xlsx(comparison, summary, meta):
     """comparison: compare_periods()'s return value. summary: generate_summary()'s
-    return value. meta: dict with 'countries', 'on_time_target_days', 'generated_at'.
-    Returns .xlsx bytes covering the Overview + Comparison + Summary tabs in "Compare
-    two periods" mode."""
+    return value. meta: dict with 'countries', 'on_time_target_days', 'generated_at',
+    plus (Sep 2026, same as export_single_period_xlsx -- optional) 'delivery_windows',
+    'on_time_bands', 'net_delivery_bands'. Returns .xlsx bytes covering the Overview +
+    Comparison + Summary tabs in "Compare two periods" mode, PLUS a "Logistics KPIs"
+    sheet when bands are supplied -- the trend (Delta) and each period's own
+    Below/Target/Exceed status shown together, the same "improving AND on/off target
+    are 2 different questions" idea as the on-screen Comparison tab."""
+    band_fn = _band_fn_from_meta(meta)
     metrics_a, metrics_b, deltas = comparison['period_a'], comparison['period_b'], comparison['deltas']
     label_a = _period_label(metrics_a['start_date'], metrics_a['end_date'])
     label_b = _period_label(metrics_b['start_date'], metrics_b['end_date'])
@@ -947,7 +1120,7 @@ def export_comparison_xlsx(comparison, summary, meta):
         f"On-time delivery target (per market): {_format_on_time_target_meta(meta['on_time_target_days'])}",
         f"Generated: {meta['generated_at']}",
     ])
-    _, last = _write_comparison_metric_table(ws, r, 1, metrics_a, metrics_b, deltas, label_a, label_b)
+    _, last = _write_comparison_metric_table(ws, r, 1, metrics_a, metrics_b, deltas, label_a, label_b, band_fn=band_fn)
     chart_row = last + 3
     bottom_a = _write_status_table_and_chart(ws, chart_row, 1, metrics_a, f"{label_a} -- by status")
     _write_status_table_and_chart(ws, chart_row, 10, metrics_b, f"{label_b} -- by status")
@@ -956,6 +1129,14 @@ def export_comparison_xlsx(comparison, summary, meta):
     _write_per_country_sheet(ws_a, metrics_a['per_country'], f"{label_a} ({metrics_a['start_date']} → {metrics_a['end_date']})")
     ws_b = wb.create_sheet('Per Country - Period B')
     _write_per_country_sheet(ws_b, metrics_b['per_country'], f"{label_b} ({metrics_b['start_date']} → {metrics_b['end_date']})")
+
+    if meta.get('on_time_bands') and meta.get('net_delivery_bands'):
+        ws_kpi = wb.create_sheet('Logistics KPIs')
+        delivery_windows = meta.get('delivery_windows') or {}
+        rows_a = per_country_kpi_rows(metrics_a, delivery_windows, meta['on_time_bands'], meta['net_delivery_bands'])
+        rows_b = per_country_kpi_rows(metrics_b, delivery_windows, meta['on_time_bands'], meta['net_delivery_bands'])
+        next_row = _write_kpi_band_table(ws_kpi, 1, 1, rows_a, f"{label_a} ({metrics_a['start_date']} → {metrics_a['end_date']})")
+        _write_kpi_band_table(ws_kpi, next_row + 1, 1, rows_b, f"{label_b} ({metrics_b['start_date']} → {metrics_b['end_date']})")
 
     ws_cmp = wb.create_sheet('Comparison')
     ws_cmp.cell(row=1, column=1, value=f"{label_a} (baseline) vs. {label_b}, by market").font = _XLSX_TITLE_FONT
