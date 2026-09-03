@@ -379,13 +379,24 @@ def _metrics_for_slice(sub, on_time_target_days=None, net_delivery_matured_thres
     fulfillment_days, fulfillment_n = _avg_day_gap(sub, '_order_date', '_shipping_date')
 
     delivered = sub[sub['_status'] == 'Delivered']
-    delivery_days, delivery_n = _avg_day_gap(delivered, '_order_date', '_delivery_date')
+    # Delivery Time / On-Time Delivery Rate both measure the SHIPPING leg only --
+    # Shipping Date -> Delivery Date, NOT Order Date -> Delivery Date (Sep 2026,
+    # reconciled against the CEO Q3 2026 scorecard: the scorecard's own windows are
+    # "fulfilment to delivery" / "system transit windows", i.e. the shipping company's
+    # own transit time, extracted from their system -- it does not include however long
+    # an order sat before it even reached them. That earlier stretch is a DIFFERENT
+    # metric already tracked on its own: Fulfillment lead time (Order Date ->
+    # Shipping Date, just above). Mixing the two into one Order-Date-based gap would
+    # blame the shipping company's KPI for delays that actually happened in
+    # confirmation/prep -- a Call Center/Ops problem, not a delivery one -- and would
+    # make every per-market window too tight to mean anything.
+    delivery_days, delivery_n = _avg_day_gap(delivered, '_shipping_date', '_delivery_date')
 
     on_time_rate, on_time_n = None, 0
     if on_time_target_days is not None:
-        have_both = delivered[delivered['_order_date'].notna() & delivered['_delivery_date'].notna()]
+        have_both = delivered[delivered['_shipping_date'].notna() & delivered['_delivery_date'].notna()]
         if not have_both.empty:
-            gap = (have_both['_delivery_date'] - have_both['_order_date']).dt.days
+            gap = (have_both['_delivery_date'] - have_both['_shipping_date']).dt.days
             targets = have_both['_country'].map(lambda c: _resolve_on_time_target(c, on_time_target_days))
             evaluable = targets.notna()
             if evaluable.any():
