@@ -9,10 +9,10 @@ import plotly.graph_objects as go
 from logic import (
     STATUSES, METRIC_LABELS, METRIC_DIRECTION,
     DEFAULT_DELIVERY_WINDOWS, DEFAULT_KPI_BANDS, DEFAULT_NET_DELIVERY_MATURED_THRESHOLD,
-    DEFAULT_WEAK_POINT_THRESHOLDS, STAGING_SPREADSHEET_ID_DEFAULT,
+    DEFAULT_WEAK_POINT_THRESHOLDS, DEFAULT_USD_RATES, STAGING_SPREADSHEET_ID_DEFAULT,
     get_client, load_orders_data, compute_period_metrics, compare_periods, generate_summary,
     export_single_period_xlsx, export_comparison_xlsx, classify_band, classify_delivery_time_band,
-    per_country_kpi_rows,
+    per_country_kpi_rows, convert_order_values_to_usd,
 )
 
 st.set_page_config(page_title="Ops Pulse", layout="wide")
@@ -229,6 +229,43 @@ with st.sidebar:
         thresholds['on_time_rate_pp'] = st.number_input("On-time rate drop (pp)", 0.5, 20.0, DEFAULT_WEAK_POINT_THRESHOLDS['on_time_rate_pp'], 0.5)
         thresholds['net_delivery_rate_pp'] = st.number_input("Net delivery rate drop (pp)", 0.5, 20.0, DEFAULT_WEAK_POINT_THRESHOLDS['net_delivery_rate_pp'], 0.5)
 
+        # Sep 2026, per Mahmoud: every money figure on the staging sheet is recorded in
+        # its OWN market's native currency (Iraq in IQD, UAE & Oman in AED, the whole
+        # Gulf group in BHD -- see logic.COUNTRY_CURRENCY), never converted anywhere
+        # today. "USD" here converts every money figure (cards + per-country table +
+        # xlsx download) to USD using the rates below; "Original" leaves everything
+        # exactly as recorded, same as before this setting existed.
+        st.caption("Currency for every money figure on this page and in the download.")
+        currency_choice = st.radio("Currency", ["Original (as recorded)", "USD"], horizontal=True)
+        currency_mode = 'USD' if currency_choice == 'USD' else 'original'
+        usd_rates = dict(DEFAULT_USD_RATES)
+        if currency_mode == 'USD':
+            st.caption(
+                "1 USD = how many of each currency -- NOT live rates, starting "
+                "defaults only, edit freely. AED and BHD are both long-standing hard "
+                "pegs to the Dollar; IQD drifts more, so it's worth checking that one "
+                "periodically."
+            )
+            rc1, rc2, rc3 = st.columns(3)
+            usd_rates['AED'] = rc1.number_input("1 USD = _ AED", min_value=0.0001, value=DEFAULT_USD_RATES['AED'], step=0.0001, format="%.4f")
+            usd_rates['BHD'] = rc2.number_input("1 USD = _ BHD", min_value=0.0001, value=DEFAULT_USD_RATES['BHD'], step=0.0001, format="%.4f")
+            usd_rates['IQD'] = rc3.number_input("1 USD = _ IQD", min_value=0.0001, value=DEFAULT_USD_RATES['IQD'], step=1.0, format="%.2f")
+
+# Sep 2026: convert EVERY order's value to USD once here, right after the currency
+# setting is known and before any period filtering/metric computation happens -- every
+# metric downstream (cards, per-country table, xlsx export) just reads _order_value the
+# same way it always has, so this single conversion point is what keeps the screen and
+# the download in sync automatically (see logic.convert_order_values_to_usd).
+unmapped_currency_countries = set()
+if currency_mode == 'USD':
+    df, unmapped_currency_countries = convert_order_values_to_usd(df, usd_rates)
+if unmapped_currency_countries:
+    st.warning(
+        f"No currency mapped for: {', '.join(sorted(unmapped_currency_countries))} -- "
+        "their Order Value was left UNCONVERTED (still in whatever currency it was "
+        "recorded in), not guessed at."
+    )
+
 if not countries:
     st.warning("Pick at least one country/market in the sidebar.")
     st.stop()
@@ -247,7 +284,14 @@ def _days(x):
 
 
 def _money(x):
-    return f"{x:,.0f}" if x is not None else "—"
+    # Sep 2026: USD mode shows a $ prefix + 2 decimals (a converted figure is smaller
+    # and less round than the native-currency one, so the extra precision matters more
+    # here); Original mode is unchanged from before this setting existed.
+    if x is None:
+        return "—"
+    if currency_mode == 'USD':
+        return f"${x:,.2f}"
+    return f"{x:,.0f}"
 
 
 def render_metric_cards(metrics, delta_metrics=None):
@@ -446,6 +490,9 @@ export_meta = {
     'delivery_windows': delivery_windows,
     'on_time_bands': (on_time_target_pct, on_time_exceed_pct),
     'net_delivery_bands': (net_delivery_target_pct, net_delivery_exceed_pct),
+    # Sep 2026: so every money cell in the download gets the same $ formatting as the
+    # on-screen cards -- see logic.py's _number_formats / convert_order_values_to_usd.
+    'currency_mode': currency_mode,
     'generated_at': dt.datetime.now().strftime('%Y-%m-%d %H:%M'),
 }
 
