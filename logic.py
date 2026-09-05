@@ -111,6 +111,35 @@ DEFAULT_KPI_BANDS = {
 # / net_delivery_matured / in_transit_share.
 DEFAULT_NET_DELIVERY_MATURED_THRESHOLD = 0.10
 
+# Sep 2026, per Mahmoud: which native currency each market's Order Value is actually
+# recorded in on the staging sheet -- Iraq in its own Dinar, UAE & Oman together in UAE
+# Dirham, and the whole Gulf group (SA/QA/KW) in Bahraini Dinar. The Gulf one is not a
+# typo: confirmed against a real Gulf Shopify export where the 'Order currency' column
+# read BHD even for a Qatar-shipped order -- the Gulf Shopify store's base currency is
+# BHD regardless of destination country, not each country's own currency. Used by
+# convert_order_values_to_usd() when the "USD" currency mode is picked in Advanced
+# settings; in "Original" mode this mapping is never consulted and every value is shown
+# exactly as recorded, same as before this feature existed.
+COUNTRY_CURRENCY = {
+    'IQ': 'IQD',
+    'UAE': 'AED',
+    'OM': 'AED',
+    'SA': 'BHD',
+    'QA': 'BHD',
+    'KW': 'BHD',
+}
+
+# Starting-point USD conversion rates (units of that currency per 1 USD) -- editable
+# from Advanced settings, NOT live/fetched. AED and BHD are both long-standing hard
+# pegs to the US Dollar (essentially unchanged for decades); IQD is only loosely
+# managed and drifts more over time, so it's worth checking/updating that one
+# periodically rather than trusting this default indefinitely.
+DEFAULT_USD_RATES = {
+    'AED': 3.6725,
+    'BHD': 0.376,
+    'IQD': 1310.0,
+}
+
 # Weak-point thresholds (Sep 2026, per Mahmoud: "sensible defaults I define, but keep
 # them adjustable from the UI too" -- see app.py's threshold sliders). All in
 # "how much WORSE than the baseline period counts as a weak point" terms. Rates are in
@@ -353,6 +382,30 @@ def combine_tabs(orders_df, not_shipped_df):
     combined = combined.drop_duplicates(subset='_ref_key', keep='first')
     combined = combined.drop(columns=['_priority']).reset_index(drop=True)
     return combined
+
+
+def convert_order_values_to_usd(df, usd_rates):
+    """Sep 2026, per Mahmoud: converts every order's _order_value from its own market's
+    native currency (see COUNTRY_CURRENCY) into USD, using usd_rates ({currency_code:
+    units of that currency per 1 USD} -- see DEFAULT_USD_RATES for the shape). Returns
+    (converted_df, unmapped_countries): converted_df is a COPY of df (the original is
+    left untouched), unmapped_countries is the set of any _country value with no entry
+    in COUNTRY_CURRENCY at all -- those rows are left with their ORIGINAL value
+    (nothing guessed) so app.py can warn about them instead of silently mis-converting.
+
+    Called once, right after the sidebar's currency settings are known and BEFORE any
+    period filtering/metric computation happens -- every metric downstream (screen
+    cards, per-country table, xlsx export) just reads _order_value the same way it
+    always has, so converting it here in one place is what keeps the on-screen numbers
+    and the download in sync automatically, the same single-source-of-truth reasoning
+    as per_country_kpi_rows() for the Below/Target/Exceed bands."""
+    out = df.copy()
+    currency = out['_country'].map(COUNTRY_CURRENCY)
+    unmapped = set(out.loc[currency.isna(), '_country'].unique())
+    rate = currency.map(usd_rates)
+    converted = out['_order_value'] / rate
+    out['_order_value'] = converted.where(rate.notna(), out['_order_value'])
+    return out, unmapped
 
 
 # ---------------------------------------------------------------------------
@@ -756,7 +809,19 @@ _COMPARISON_METRICS = [
     ('pending_rate', 'Pending', 'Pending'),
 ]
 
-_NUMBER_FORMATS = {'pct': '0.0%', 'days': '0.0"d"', 'money': '#,##0', 'count': '#,##0'}
+def _number_formats(currency_mode='original'):
+    """Sep 2026: 'money' cells get a $ currency format when this export was generated
+    with the "USD" currency setting (see convert_order_values_to_usd / app.py's
+    Advanced settings) -- 'pct'/'days'/'count' are currency-independent and never
+    change. currency_mode: 'original' (default -- unchanged from before this feature
+    existed) or 'USD'."""
+    return {
+        'pct': '0.0%', 'days': '0.0"d"', 'count': '#,##0',
+        'money': '$#,##0.00' if currency_mode == 'USD' else '#,##0',
+    }
+
+
+_NUMBER_FORMATS = _number_formats('original')
 
 
 def _metric_value(m, key):
@@ -839,12 +904,15 @@ def _write_band_cell(ws, row, col, band):
     return cell
 
 
-def _write_metric_value_table(ws, top_row, left_col, metric_defs, metrics, band_fn=None):
+def _write_metric_value_table(ws, top_row, left_col, metric_defs, metrics, band_fn=None, number_formats=None):
     """Metric | Value [| Band] table -- one row per (key, label, kind) in metric_defs,
     value pulled from metrics[key]. band_fn(key, value) -> 'below'/'target'/'exceed'/None
     (Sep 2026) adds a 3rd Band column, colour-filled to match the on-screen captions --
-    omit it for metrics with no CEO-scorecard band (most of them). Returns
-    (first_data_row, last_data_row)."""
+    omit it for metrics with no CEO-scorecard band (most of them). number_formats (Sep
+    2026): the _number_formats()-shaped dict to use for cell formatting -- omit for the
+    original/default ('original' currency mode) formats. Returns (first_data_row,
+    last_data_row)."""
+    nf = number_formats or _NUMBER_FORMATS
     headers = ['Metric', 'Value'] + (['Band'] if band_fn else [])
     _write_header_row(ws, top_row, left_col, headers)
     r = top_row + 1
@@ -852,7 +920,7 @@ def _write_metric_value_table(ws, top_row, left_col, metric_defs, metrics, band_
         ws.cell(row=r, column=left_col, value=label).font = _XLSX_BODY_FONT
         val_cell = ws.cell(row=r, column=left_col + 1, value=metrics.get(key))
         val_cell.font = _XLSX_BODY_FONT
-        val_cell.number_format = _NUMBER_FORMATS[kind]
+        val_cell.number_format = nf[kind]
         if band_fn:
             _write_band_cell(ws, r, left_col + 2, band_fn(key, metrics.get(key)))
         r += 1
@@ -907,14 +975,16 @@ def _write_comparison_metric_table(ws, top_row, left_col, metrics_a, metrics_b, 
     return top_row + 1, r - 1
 
 
-def _write_status_table_and_chart(ws, top_row, left_col, metrics, title):
+def _write_status_table_and_chart(ws, top_row, left_col, metrics, title, number_formats=None):
     """Status | Count | Value table, with its bar chart (count-based) anchored BELOW
     the table (not beside it) -- keeps the chart clear of whatever table sits to its
     right (e.g. this function is called twice per row for Period A/B side by side;
     anchoring below instead of beside removes any risk of the two charts, or a chart
     and a neighbouring table, overlapping regardless of exact column widths). The Value
     column is the money behind each status (Sep 2026, per Mahmoud: "عاوز احسب فلوس
-    الاوردرات الوصلت و الرجعت و الاتكنسل والبندج")."""
+    الاوردرات الوصلت و الرجعت و الاتكنسل والبندج"). number_formats (Sep 2026): see
+    _write_metric_value_table."""
+    nf = number_formats or _NUMBER_FORMATS
     headers = ['Status', 'Count', 'Value']
     _write_header_row(ws, top_row, left_col, headers)
     r = top_row + 1
@@ -922,10 +992,10 @@ def _write_status_table_and_chart(ws, top_row, left_col, metrics, title):
         ws.cell(row=r, column=left_col, value=s).font = _XLSX_BODY_FONT
         cell = ws.cell(row=r, column=left_col + 1, value=metrics['status_counts'][s])
         cell.font = _XLSX_BODY_FONT
-        cell.number_format = _NUMBER_FORMATS['count']
+        cell.number_format = nf['count']
         value_cell = ws.cell(row=r, column=left_col + 2, value=metrics['status_value'][s])
         value_cell.font = _XLSX_BODY_FONT
-        value_cell.number_format = _NUMBER_FORMATS['money']
+        value_cell.number_format = nf['money']
         r += 1
     last_row = r - 1
 
@@ -949,7 +1019,9 @@ def _write_status_table_and_chart(ws, top_row, left_col, metrics, title):
     return chart_row + 14  # bottom row of the chart, roughly (14 rows tall @ ~7cm)
 
 
-def _write_per_country_sheet(ws, per_country, title):
+def _write_per_country_sheet(ws, per_country, title, number_formats=None):
+    """number_formats (Sep 2026): see _write_metric_value_table."""
+    nf = number_formats or _NUMBER_FORMATS
     ws.cell(row=1, column=1, value=title).font = _XLSX_TITLE_FONT
     top_row = 3
     headers = ['Country'] + [label for _, label, _ in _PER_COUNTRY_METRICS]
@@ -961,7 +1033,7 @@ def _write_per_country_sheet(ws, per_country, title):
         for c, (key, _, kind) in enumerate(_PER_COUNTRY_METRICS, start=2):
             cell = ws.cell(row=r, column=c, value=_metric_value(m, key))
             cell.font = _XLSX_BODY_FONT
-            cell.number_format = _NUMBER_FORMATS[kind]
+            cell.number_format = nf[kind]
         r += 1
     last_row = r - 1
     if last_row < top_row + 1:
@@ -1067,9 +1139,12 @@ def export_single_period_xlsx(metrics, meta):
     Below/Target/Exceed bands shown on screen make it into the download too --
     optional, omitting them just means no Band column/sheet) 'delivery_windows'
     ({country: (low, high)}), 'on_time_bands' / 'net_delivery_bands' ((target, exceed)
-    tuples). Returns .xlsx bytes with the same numbers/breakdown/bands as the Overview
-    tab in "Single period" mode."""
+    tuples), and (Sep 2026, optional -- defaults to 'original') 'currency_mode'
+    ('original' or 'USD', see convert_order_values_to_usd) so every money cell in the
+    download gets the same $ formatting as the on-screen cards. Returns .xlsx bytes
+    with the same numbers/breakdown/bands as the Overview tab in "Single period" mode."""
     band_fn = _band_fn_from_meta(meta)
+    number_formats = _number_formats(meta.get('currency_mode', 'original'))
     wb = Workbook()
     ws = wb.active
     ws.title = 'Overview'
@@ -1080,11 +1155,11 @@ def export_single_period_xlsx(metrics, meta):
         f"On-time delivery target (per market): {_format_on_time_target_meta(meta['on_time_target_days'])}",
         f"Generated: {meta['generated_at']}",
     ])
-    _, last = _write_metric_value_table(ws, r, 1, _METRIC_ROWS, metrics, band_fn=band_fn)
-    _write_status_table_and_chart(ws, last + 3, 1, metrics, 'Orders by status')
+    _, last = _write_metric_value_table(ws, r, 1, _METRIC_ROWS, metrics, band_fn=band_fn, number_formats=number_formats)
+    _write_status_table_and_chart(ws, last + 3, 1, metrics, 'Orders by status', number_formats=number_formats)
 
     ws2 = wb.create_sheet('Per Country')
-    _write_per_country_sheet(ws2, metrics['per_country'], f"{metrics['start_date']} → {metrics['end_date']} -- by country")
+    _write_per_country_sheet(ws2, metrics['per_country'], f"{metrics['start_date']} → {metrics['end_date']} -- by country", number_formats=number_formats)
 
     if meta.get('on_time_bands') and meta.get('net_delivery_bands'):
         ws3 = wb.create_sheet('Logistics KPIs')
@@ -1099,12 +1174,13 @@ def export_comparison_xlsx(comparison, summary, meta):
     """comparison: compare_periods()'s return value. summary: generate_summary()'s
     return value. meta: dict with 'countries', 'on_time_target_days', 'generated_at',
     plus (Sep 2026, same as export_single_period_xlsx -- optional) 'delivery_windows',
-    'on_time_bands', 'net_delivery_bands'. Returns .xlsx bytes covering the Overview +
-    Comparison + Summary tabs in "Compare two periods" mode, PLUS a "Logistics KPIs"
-    sheet when bands are supplied -- the trend (Delta) and each period's own
-    Below/Target/Exceed status shown together, the same "improving AND on/off target
-    are 2 different questions" idea as the on-screen Comparison tab."""
+    'on_time_bands', 'net_delivery_bands', 'currency_mode'. Returns .xlsx bytes covering
+    the Overview + Comparison + Summary tabs in "Compare two periods" mode, PLUS a
+    "Logistics KPIs" sheet when bands are supplied -- the trend (Delta) and each
+    period's own Below/Target/Exceed status shown together, the same "improving AND
+    on/off target are 2 different questions" idea as the on-screen Comparison tab."""
     band_fn = _band_fn_from_meta(meta)
+    number_formats = _number_formats(meta.get('currency_mode', 'original'))
     metrics_a, metrics_b, deltas = comparison['period_a'], comparison['period_b'], comparison['deltas']
     label_a = _period_label(metrics_a['start_date'], metrics_a['end_date'])
     label_b = _period_label(metrics_b['start_date'], metrics_b['end_date'])
@@ -1122,13 +1198,13 @@ def export_comparison_xlsx(comparison, summary, meta):
     ])
     _, last = _write_comparison_metric_table(ws, r, 1, metrics_a, metrics_b, deltas, label_a, label_b, band_fn=band_fn)
     chart_row = last + 3
-    bottom_a = _write_status_table_and_chart(ws, chart_row, 1, metrics_a, f"{label_a} -- by status")
-    _write_status_table_and_chart(ws, chart_row, 10, metrics_b, f"{label_b} -- by status")
+    bottom_a = _write_status_table_and_chart(ws, chart_row, 1, metrics_a, f"{label_a} -- by status", number_formats=number_formats)
+    _write_status_table_and_chart(ws, chart_row, 10, metrics_b, f"{label_b} -- by status", number_formats=number_formats)
 
     ws_a = wb.create_sheet('Per Country - Period A')
-    _write_per_country_sheet(ws_a, metrics_a['per_country'], f"{label_a} ({metrics_a['start_date']} → {metrics_a['end_date']})")
+    _write_per_country_sheet(ws_a, metrics_a['per_country'], f"{label_a} ({metrics_a['start_date']} → {metrics_a['end_date']})", number_formats=number_formats)
     ws_b = wb.create_sheet('Per Country - Period B')
-    _write_per_country_sheet(ws_b, metrics_b['per_country'], f"{label_b} ({metrics_b['start_date']} → {metrics_b['end_date']})")
+    _write_per_country_sheet(ws_b, metrics_b['per_country'], f"{label_b} ({metrics_b['start_date']} → {metrics_b['end_date']})", number_formats=number_formats)
 
     if meta.get('on_time_bands') and meta.get('net_delivery_bands'):
         ws_kpi = wb.create_sheet('Logistics KPIs')
@@ -1175,7 +1251,7 @@ def export_comparison_xlsx(comparison, summary, meta):
             ):
                 cell = ws_cmp.cell(row=r2, column=col_offset, value=val)
                 cell.font = _XLSX_BODY_FONT
-                cell.number_format = _NUMBER_FORMATS[kind]
+                cell.number_format = number_formats[kind]
             r2 += 1
         last_row2 = r2 - 1
 
