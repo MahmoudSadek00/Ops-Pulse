@@ -345,7 +345,13 @@ def render_metric_cards(metrics, delta_metrics=None):
     if cap:
         c8.caption(cap)
 
-    c8b, c8c = st.columns(2)
+    # Sep 2026: st.columns(2) here (vs. columns(4) everywhere else on this row) is what
+    # was making this row look full of blank space -- each of the 2 cards sat in a box
+    # TWICE as wide as every other card on the page, with all the extra width reading as
+    # empty gap since st.metric() doesn't stretch its content to fill it. columns(4)
+    # with only the first 2 slots used matches every other row's card width exactly, so
+    # the leftover space shrinks down to the same small gaps the rest of the grid has.
+    c8b, c8c, _c8d, _c8e = st.columns(4)
     if metrics.get('net_delivery_matured'):
         c8b.metric("Net delivery rate", _pct(metrics['net_delivery_rate']),
                     delta=(f"{delta_metrics['net_delivery_rate']:+.1f}pp" if delta_metrics and delta_metrics.get('net_delivery_rate') is not None else None),
