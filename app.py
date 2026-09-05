@@ -13,7 +13,7 @@ from logic import (
     DEFAULT_WEAK_POINT_THRESHOLDS, DEFAULT_USD_RATES, STAGING_SPREADSHEET_ID_DEFAULT,
     get_client, load_orders_data, compute_period_metrics, compare_periods, generate_summary,
     export_single_period_xlsx, export_comparison_xlsx, classify_band, classify_delivery_time_band,
-    per_country_kpi_rows, convert_order_values_to_usd,
+    per_country_kpi_rows, convert_order_values_to_usd, filter_period,
 )
 
 st.set_page_config(page_title="Ops Pulse", layout="wide")
@@ -41,7 +41,22 @@ st.markdown("""
         letter-spacing: .02em;
         text-transform: uppercase;
     }
-    div[data-testid="stMetricValue"] { color: #F4F6F8; font-weight: 700; }
+    div[data-testid="stMetric"] { min-width: 0; }
+    div[data-testid="stMetricValue"] {
+        color: #F4F6F8;
+        font-weight: 700;
+        /* Sep 2026 fix: Streamlit's own metric CSS truncates long values with an
+        ellipsis ("$9,493,180...") once a card gets narrow (4-up money cards easily
+        overflow) -- overriding those three properties lets a long figure wrap onto a
+        second line inside the card instead of being cut off, and the slightly smaller
+        size keeps most values on one line to begin with. */
+        font-size: 1.55rem;
+        line-height: 1.25;
+        white-space: normal !important;
+        overflow: visible !important;
+        text-overflow: clip !important;
+        word-break: break-word;
+    }
     h1, h2, h3 { letter-spacing: -0.01em; }
     h2, h3 { border-bottom: 1px solid #262B35; padding-bottom: 6px; margin-top: 1.6rem; }
     div[data-testid="stDataFrame"] { border: 1px solid #262B35; border-radius: 10px; overflow: hidden; }
@@ -503,6 +518,65 @@ def per_country_kpi_table(metrics):
     return pd.DataFrame(rows)
 
 
+def daily_order_volume_chart(df, start_date, end_date, countries, title="Order Volume Trend"):
+    """A single-series time trend (per Mahmoud, Sep 2026: "زي ال Order Volume Trend
+    بتاع الباور بي اي") -- daily order count over the selected period, one accent
+    hue (the app's own primary blue, so it reads as part of Ops Pulse rather than a
+    borrowed chart style), a soft area fill, a dotted average line, and a callout on
+    the peak day. Returns (fig, caption) or (None, None) if there's nothing to plot."""
+    sub = filter_period(df, start_date, end_date, countries=countries)
+    if sub.empty:
+        return None, None
+
+    daily = sub.groupby(sub['_order_date'].dt.date).size()
+    full_range = pd.date_range(daily.index.min(), daily.index.max(), freq='D').date
+    daily = daily.reindex(full_range, fill_value=0)  # fill silent days as 0, not a gap in the line
+
+    avg = float(daily.mean())
+    peak_date = daily.idxmax()
+    peak_val = int(daily.loc[peak_date])
+    ratio = (peak_val / avg) if avg else None
+
+    ACCENT = '#5B8DEF'  # same primaryColor as .streamlit/config.toml -- ties this chart to the app's own accent
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=list(daily.index), y=list(daily.values), mode='lines',
+        line=dict(shape='spline', smoothing=0.35, width=2, color=ACCENT),
+        fill='tozeroy', fillcolor='rgba(91,141,239,0.14)',
+        hovertemplate='%{x|%b %d, %Y}<br>%{y:,} orders<extra></extra>',
+        name='Daily orders',
+    ))
+    fig.add_hline(
+        y=avg, line_dash='dot', line_width=1, line_color='#9AA4B2',
+        annotation_text=f"Avg {avg:.0f}/day", annotation_position="top left",
+        annotation_font=dict(color='#9AA4B2', size=11),
+    )
+    fig.add_trace(go.Scatter(
+        x=[peak_date], y=[peak_val], mode='markers',
+        marker=dict(size=8, color=ACCENT, line=dict(width=2, color='#F4F6F8')),
+        hoverinfo='skip', showlegend=False,
+    ))
+    fig.add_annotation(
+        x=peak_date, y=peak_val, text=f"Peak {peak_val:,}", showarrow=True, arrowhead=2,
+        arrowcolor='#9AA4B2', ax=0, ay=-32,
+        font=dict(color='#F4F6F8', size=11), bgcolor='rgba(23,26,33,0.9)',
+        bordercolor='#262B35', borderwidth=1, borderpad=4,
+    )
+    fig.update_layout(
+        title=title, showlegend=False, height=300, hovermode='x unified',
+        margin=dict(l=10, r=10, t=40, b=10), xaxis_title=None, yaxis_title=None,
+    )
+    fig.update_xaxes(showgrid=False)
+    fig.update_yaxes(showgrid=True, gridcolor='rgba(255,255,255,0.06)', zeroline=False)
+
+    caption = (
+        f"Daily order volume -- averaging {avg:.0f} orders/day, with a peak of "
+        f"{peak_val:,} orders on {peak_date.strftime('%B %d, %Y')}"
+        + (f" (~{ratio:.1f}x the typical average)." if ratio else ".")
+    )
+    return fig, caption
+
+
 def comparison_bar_chart(comparison, rate_key, title, as_pct=True):
     countries_here = sorted(set(comparison['period_a']['per_country']) | set(comparison['period_b']['per_country']))
     rows = []
@@ -586,6 +660,11 @@ if mode == "Single period":
         else:
             st.caption("No markets in this selection have data for the period.")
 
+        fig, caption = daily_order_volume_chart(df, start_date, end_date, countries)
+        if fig:
+            st.plotly_chart(fig, use_container_width=True)
+            st.caption(caption)
+
         col1, col2 = st.columns(2)
         with col1:
             st.plotly_chart(status_breakdown_chart(metrics, "Orders by status"), use_container_width=True)
@@ -642,6 +721,16 @@ else:
             kpi_table_a = per_country_kpi_table(metrics_a)
             if not kpi_table_a.empty:
                 st.dataframe(kpi_table_a, use_container_width=True, hide_index=True)
+
+        fig, caption = daily_order_volume_chart(df, b_start, b_end, countries, title="Order Volume Trend -- Period B")
+        if fig:
+            st.plotly_chart(fig, use_container_width=True)
+            st.caption(caption)
+        with st.expander("Same chart for Period A (baseline)"):
+            fig_a, caption_a = daily_order_volume_chart(df, a_start, a_end, countries, title="Order Volume Trend -- Period A")
+            if fig_a:
+                st.plotly_chart(fig_a, use_container_width=True)
+                st.caption(caption_a)
 
         col1, col2 = st.columns(2)
         with col1:
