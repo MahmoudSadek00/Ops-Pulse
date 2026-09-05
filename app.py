@@ -5,6 +5,7 @@ import pandas as pd
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
+import plotly.io as pio
 
 from logic import (
     STATUSES, METRIC_LABELS, METRIC_DIRECTION,
@@ -16,6 +17,49 @@ from logic import (
 )
 
 st.set_page_config(page_title="Ops Pulse", layout="wide")
+
+# Sep 2026, per Mahmoud: dark professional theme -- the actual color palette lives in
+# .streamlit/config.toml ([theme] base="dark" + accent/background colors); this CSS
+# block only dresses up a few widgets config.toml can't reach on its own (metric cards
+# as bordered "tiles", section-header underlines, a bordered look for tables and the
+# download button). Every selector below is a stable Streamlit data-testid, not a class
+# name that shifts between versions -- if a future Streamlit upgrade ever renames one,
+# that one rule just stops applying (harmless) rather than breaking the page.
+st.markdown("""
+<style>
+    div[data-testid="stMetric"] {
+        background: linear-gradient(180deg, #171A21 0%, #14161B 100%);
+        border: 1px solid #262B35;
+        border-radius: 12px;
+        padding: 14px 18px 10px 18px;
+        box-shadow: 0 1px 4px rgba(0,0,0,0.35);
+    }
+    div[data-testid="stMetricLabel"] p {
+        color: #9AA4B2 !important;
+        font-size: 0.82rem !important;
+        font-weight: 500 !important;
+        letter-spacing: .02em;
+        text-transform: uppercase;
+    }
+    div[data-testid="stMetricValue"] { color: #F4F6F8; font-weight: 700; }
+    h1, h2, h3 { letter-spacing: -0.01em; }
+    h2, h3 { border-bottom: 1px solid #262B35; padding-bottom: 6px; margin-top: 1.6rem; }
+    div[data-testid="stDataFrame"] { border: 1px solid #262B35; border-radius: 10px; overflow: hidden; }
+    section[data-testid="stSidebar"] { border-right: 1px solid #262B35; }
+    div[data-testid="stDownloadButton"] button {
+        background-color: #5B8DEF; color: white; border: none; font-weight: 600;
+        border-radius: 8px;
+    }
+    div[data-testid="stDownloadButton"] button:hover { background-color: #4879D9; color: white; }
+</style>
+""", unsafe_allow_html=True)
+
+# So every Plotly chart on the page (status breakdown, per-country bars, comparison
+# bars) matches the app's own dark background by default instead of clashing with a
+# white plot area -- set once, globally, rather than repeating a template= kwarg on
+# every px.bar/go.Figure call below.
+pio.templates.default = "plotly_dark"
+
 st.title("Ops Pulse")
 st.caption(
     "Reads the staging spreadsheet's \"Orders\" + \"Not Shipped\" tabs TOGETHER (Sep "
